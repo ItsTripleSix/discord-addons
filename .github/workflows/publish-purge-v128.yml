@@ -79,3 +79,5 @@ jobs:
           git diff --cached --check
           git commit -m "Release Purge Tools v1.2.8"
           git push origin HEAD:main
+
+# trigger
