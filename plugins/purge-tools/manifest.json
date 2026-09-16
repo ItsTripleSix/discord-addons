@@ -1,13 +1,13 @@
 {
   "name": "Purge Tools",
-  "description": "Purge Tools v1.2.8 with adaptive shared pacing, transient 5xx retries and recovered/unresolved failure accounting, reusable previews, message/reaction cleanup, verification, media protection, and persistent resume checkpoints.",
+  "description": "Purge Tools v1.2.9 with adaptive shared pacing, transient 5xx retries, previews, message/reaction cleanup, verification, media protection, resume checkpoints, and prominent account-risk warnings.",
   "authors": [
     {
       "name": "ItsTripleSix"
     }
   ],
   "main": "index.js",
-  "hash": "5dde657b841dddf8967621b15da5c3adcaf297e5",
+  "hash": "2f4a650248c9158cf6db6ca636ab0676242bf03b",
   "vendetta": {
     "icon": "TrashIcon"
   }
