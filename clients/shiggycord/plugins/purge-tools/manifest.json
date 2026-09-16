@@ -1,0 +1,14 @@
+{
+  "name": "Purge Tools",
+  "description": "ShiggyCord Purge Tools with conservative shared pacing, transient 5xx retry/recovery accounting, previews, media protection, verification, and account-scoped resume checkpoints.",
+  "authors": [
+    {
+      "name": "ItsTripleSix"
+    }
+  ],
+  "main": "index.js",
+  "hash": "d348a7fe39ff3ae03eecfb0cb94e9ba526675b84",
+  "vendetta": {
+    "icon": "TrashIcon"
+  }
+}

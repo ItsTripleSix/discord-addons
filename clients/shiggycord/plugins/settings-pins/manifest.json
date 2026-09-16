@@ -1,0 +1,14 @@
+{
+  "name": "Settings Pins",
+  "description": "Pin plugin settings into ShiggyCord or hide existing non-core plugin shortcuts. Changes apply after ReShiggy.",
+  "authors": [
+    {
+      "name": "ItsTripleSix"
+    }
+  ],
+  "main": "index.js",
+  "hash": "1934179641230d0f4f5c8361d8545bc1d292feb7",
+  "vendetta": {
+    "icon": "PuzzlePieceIcon"
+  }
+}

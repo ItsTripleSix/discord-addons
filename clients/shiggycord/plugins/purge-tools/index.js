@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const V = globalThis.vendetta;
+  const V = vendetta;
   const { React, ReactNative: RN } = V.metro.common;
   const { findByProps } = V.metro;
   const storage = V.plugin?.storage ?? {};
@@ -13,7 +13,7 @@
   const VERIFY_PASSES = 3;
   const TRANSIENT_RETRIES = 2;
   const TRANSIENT_RETRY_BASE_MS = 1000;
-  const PLUGIN_VERSION = "1.2.10";
+  const PLUGIN_VERSION = "1.2.10-shiggy";
   const BULK_MAX = 100;
   const BULK_SAFE_AGE_MS = 14 * 24 * 60 * 60 * 1000 - 5 * 60 * 1000;
   const JOB_VERSION = 3;

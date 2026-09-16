@@ -1,3 +1,7 @@
-# ShiggyCord
+# ShiggyCord add-ons
 
-Reserved client layout. No add-on build is released here yet. See the repository root for the current release and staging locations.
+Stable ShiggyCord plugins live in [`plugins/`](plugins/).
+
+**7 plugins are currently released:** Account Switcher, Composer Cleaner, Hidden Channels, Purge Tools, Quick Mock, Settings Pins, and Silent Typing.
+
+Theme Toolkit is not currently ported to ShiggyCord.
