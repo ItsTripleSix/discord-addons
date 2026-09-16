@@ -11,7 +11,9 @@
   const PAGE = 100;
   const SEARCH_PAGE = 25;
   const VERIFY_PASSES = 3;
-  const PLUGIN_VERSION = "1.1.1";
+  const TRANSIENT_RETRIES = 2;
+  const TRANSIENT_RETRY_BASE_MS = 1000;
+  const PLUGIN_VERSION = "1.2.8";
   const BULK_MAX = 100;
   const BULK_SAFE_AGE_MS = 14 * 24 * 60 * 60 * 1000 - 5 * 60 * 1000;
   const JOB_VERSION = 3;
@@ -30,6 +32,7 @@
     autoResumeTimer: null,
     previewSnapshot: null,
     cleanup: null,
+    unresolvedFailures: new Set(),
   };
   globalThis[RUNTIME_KEY] = runtime;
   storage.autoResumeInterrupted ??= false;
@@ -43,6 +46,9 @@
       targetIndex: 0,
       targetCount: 0,
       currentTarget: "",
+      currentTargetKind: "",
+      currentGuildName: "",
+      currentChannelName: "",
       pages: 0,
       scanned: 0,
       messagesFound: 0,
@@ -55,6 +61,7 @@
       permissionSkipped: 0,
       skipped: 0,
       failed: 0,
+      recoveredFailures: 0,
       waitMs: 0,
       resumed: false,
     };
@@ -74,15 +81,82 @@
   function sleep(ms) { return new Promise(resolve => setTimeout(resolve, Math.max(0, ms))); }
   function clone(value) { return value == null ? value : JSON.parse(JSON.stringify(value)); }
 
+  function purgeAccountId() {
+    try {
+      const store = find("getCurrentUser");
+      const id = store?.getCurrentUser?.()?.id;
+      return id ? String(id) : "";
+    } catch { return ""; }
+  }
+  function purgeJobMap() {
+    try {
+      const raw = storage.activePurgeJobs;
+      return raw && typeof raw === "object" && !Array.isArray(raw) ? clone(raw) : {};
+    } catch { return {}; }
+  }
+  function purgeJobComplete(job) {
+    const targets = Array.isArray(job?.spec?.targets) ? job.spec.targets : [];
+    if (!targets.length) return false;
+    const completed = new Set(Array.isArray(job?.completedKeys) ? job.completedKeys : []);
+    return targets.every(target => completed.has(target.key));
+  }
+  function writePurgeJobMap(map) {
+    storage.activePurgeJobs = clone(map ?? {});
+  }
   function getSavedJob() {
     try {
-      const job = storage.activePurgeJob;
-      if (!job || job.version !== JOB_VERSION || !job.spec?.targets?.length) return null;
+      const accountId = purgeAccountId();
+      if (!accountId) return null;
+      const map = purgeJobMap();
+
+      // v1.1.4 and older stored a single unscoped checkpoint. It cannot be
+      // safely attributed after an account switch, so never auto-resume it.
+      const legacy = storage.activePurgeJob;
+      if (legacy) {
+        storage.activePurgeJob = null;
+        const legacyOwner = String(legacy?.accountId ?? "");
+        if (legacyOwner === accountId && legacy?.version === JOB_VERSION && legacy?.spec?.targets?.length && !purgeJobComplete(legacy)) {
+          map[accountId] = clone(legacy);
+          writePurgeJobMap(map);
+        }
+      }
+
+      const job = map[accountId];
+      const invalid = !job || job.version !== JOB_VERSION || !job.spec?.targets?.length || (job.accountId && String(job.accountId) !== accountId);
+      if (invalid || purgeJobComplete(job)) {
+        if (job) {
+          delete map[accountId];
+          writePurgeJobMap(map);
+          notify();
+        }
+        return null;
+      }
       return clone(job);
     } catch { return null; }
   }
-  function saveJob(job) { try { storage.activePurgeJob = clone(job); notify(); } catch {} }
-  function clearSavedJob() { try { storage.activePurgeJob = null; } catch {} notify(); }
+  function saveJob(job) {
+    const currentId = purgeAccountId();
+    const ownerId = String(job?.accountId ?? currentId ?? "");
+    if (!currentId || !ownerId) throw new Error("Could not verify the Discord account for this purge checkpoint");
+    if (ownerId !== currentId) throw new Error("Discord account changed during purge; stopped before writing this checkpoint");
+    const map = purgeJobMap();
+    map[ownerId] = { ...clone(job), accountId: ownerId };
+    writePurgeJobMap(map);
+    try { storage.activePurgeJob = null; } catch {}
+    notify();
+  }
+  function clearSavedJob() {
+    try {
+      const accountId = purgeAccountId();
+      const map = purgeJobMap();
+      if (accountId && map[accountId]) {
+        delete map[accountId];
+        writePurgeJobMap(map);
+      }
+      storage.activePurgeJob = null;
+    } catch {}
+    notify();
+  }
 
   function previewSignature(spec) {
     return JSON.stringify((spec?.targets ?? []).map(target => clone(target)));
@@ -93,44 +167,40 @@
   }
   function getMatchingPreviewSnapshot(spec) {
     const snapshot = runtime.previewSnapshot;
-    if (!snapshot || snapshot.signature !== previewSignature(spec)) return null;
+    if (!snapshot || snapshot.accountId !== purgeAccountId() || snapshot.signature !== previewSignature(spec)) return null;
     return snapshot;
   }
 
-  class Control {
-    constructor() {
-      this.cancelled = false;
-      this.userCancelled = false;
-      this.paused = false;
-      this.resumePhase = "discovering";
-    }
-    cancel(user = false) { this.cancelled = true; this.userCancelled ||= user; this.paused = false; }
-    pause() {
-      if (this.cancelled || this.paused) return;
-      if (["discovering", "purging", "verifying"].includes(progress.phase)) this.resumePhase = progress.phase;
-      this.paused = true;
-      setProgress({ phase: "paused", status: "Paused" });
-    }
-    resume() {
-      if (!this.paused || this.cancelled) return;
-      this.paused = false;
-      setProgress({ phase: this.resumePhase, status: `Resuming ${this.resumePhase}...` });
-    }
-    async check() {
-      while (this.paused && !this.cancelled) await sleep(150);
-      if (this.cancelled) throw new Error("__PURGE_CANCELLED__");
-    }
-    async wait(ms) {
-      let left = ms;
-      while (left > 0) {
-        await this.check();
-        const part = Math.min(left, 150);
-        await sleep(part);
-        left -= part;
-      }
-    }
+  const PACING_VERSION = 5;
+  const PACING_DAY = 86400000;
+  const PACING_TTL = 7 * PACING_DAY;
+  const PACING_BUFFER = 250;
+  const PACING_LONG_WAIT = 300000;
+  const PROBE_FREEZE = 180000;
+  const PROBE_ACCEPT_MS = 150000;
+  const PROBE_ACCEPT_SUCCESSES = 100;
+  const PROBE_ARM_SUCCESSES = 60;
+  const GLOBAL_START_GAP = 200;
+  const pacingFloor = kind => kind === "read" ? 200 : 350;
+  const pacingStart = kind => kind === "read" ? 400 : 1400;
+  const pacingNumber = value => {
+    if (value == null || String(value).trim() === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+  const pacingClamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  function pacingStop(message) {
+    const error = new Error(message);
+    error.purgeStop = true;
+    return error;
   }
-
+  function pacingDuration(ms) {
+    if (!Number.isFinite(ms)) return "Calculating…";
+    const seconds = Math.max(0, Math.ceil(ms / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.ceil(seconds / 60);
+    return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  }
   function responseHeader(source, name) {
     const wanted = String(name).toLowerCase();
     for (const headers of [source?.headers, source?.response?.headers]) {
@@ -140,110 +210,940 @@
           const value = headers.get(name) ?? headers.get(wanted);
           if (value != null) return value;
         }
-      } catch {}
-      try {
         for (const [key, raw] of Object.entries(headers)) {
           if (String(key).toLowerCase() !== wanted) continue;
           if (Array.isArray(raw)) return raw[0];
-          if (raw && typeof raw === "object" && "value" in raw) return raw.value;
-          return raw;
+          return raw && typeof raw === "object" && "value" in raw ? raw.value : raw;
         }
       } catch {}
     }
     return undefined;
   }
+  function pacingWindow(response, now = Date.now()) {
+    const after = pacingNumber(responseHeader(response, "X-RateLimit-Reset-After"));
+    const epoch = pacingNumber(responseHeader(response, "X-RateLimit-Reset"));
+    return after != null ? Math.ceil(after * 1000) : epoch != null ? Math.max(0, Math.ceil(epoch * 1000 - now)) : null;
+  }
+  function pacingRetry(error, now = Date.now()) {
+    const body = error?.body ?? error?.response?.body;
+    const values = [body?.retry_after, error?.retry_after, responseHeader(error, "Retry-After")]
+      .map(pacingNumber).filter(value => value != null).map(value => Math.ceil(value * 1000));
+    const header = responseHeader(error, "Retry-After");
+    if (header && pacingNumber(header) == null) {
+      const date = Date.parse(String(header));
+      if (Number.isFinite(date)) values.push(Math.max(0, date - now));
+    }
+    if (!values.length) {
+      const window = pacingWindow(error, now);
+      if (window != null) values.push(window);
+    }
+    const ms = values.length ? Math.max(...values) : 1000;
+    if (!Number.isSafeInteger(now + ms + PACING_BUFFER)) throw pacingStop("Discord returned an unreadable cooldown; stopped for review");
+    return ms;
+  }
+  function pacingIdentity(key, kind, url) {
+    const operation = String(key).split(":")[0];
+    const match = String(url ?? "").match(/^\/(channels|guilds)\/([^/]+)/);
+    const major = match ? `${match[1]}:${match[2]}` : `channels:${String(key).split(":")[1] ?? "unknown"}`;
+    return { operation, major, key: `${kind}:${operation}:${major}` };
+  }
+
+  class Control {
+    constructor() {
+      this.cancelled = false;
+      this.userCancelled = false;
+      this.paused = false;
+      this.resumePhase = "discovering";
+      this.accountId = purgeAccountId();
+      this.failure = null;
+      this.pausedAt = 0;
+      this.pausedMs = 0;
+    }
+    assertAccount() {
+      if (this.failure) throw this.failure;
+      if (!this.accountId || purgeAccountId() !== this.accountId) {
+        this.failure = pacingStop("Discord account changed; purge stopped before the next request");
+        throw this.failure;
+      }
+      if (this.cancelled) throw new Error("__PURGE_CANCELLED__");
+    }
+    pausedTime(now = Date.now()) { return this.pausedMs + (this.paused ? now - this.pausedAt : 0); }
+    cancel(user = false) {
+      this.cancelled = true;
+      this.userCancelled ||= user && purgeAccountId() === this.accountId;
+      if (this.paused) this.pausedMs += Date.now() - this.pausedAt;
+      this.paused = false;
+    }
+    pause(reason = "Paused") {
+      if (this.cancelled || this.paused) return;
+      if (["discovering", "purging", "verifying"].includes(progress.phase)) this.resumePhase = progress.phase;
+      this.paused = true;
+      this.pausedAt = Date.now();
+      setProgress({ phase: "paused", status: reason });
+    }
+    resume() {
+      if (!this.paused || this.cancelled) return;
+      try { this.assertAccount(); } catch (error) { toast(error.message); return; }
+      this.pausedMs += Date.now() - this.pausedAt;
+      this.paused = false;
+      runtime.rateController?.releaseHold();
+      setProgress({ phase: this.resumePhase, status: `Resuming ${this.resumePhase}...` });
+    }
+    async check() {
+      this.assertAccount();
+      while (this.paused && !this.cancelled) {
+        await sleep(250);
+        this.assertAccount();
+      }
+      this.assertAccount();
+    }
+    async wait(ms) {
+      const deadline = Date.now() + Math.max(0, ms);
+      do {
+        await this.check();
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return;
+        await sleep(Math.min(remaining, 250));
+      } while (true);
+    }
+  }
 
   class RateLane {
-    constructor(kind) {
-      this.delay = kind === "read" ? 150 : 650;
-      this.min = kind === "read" ? 75 : 300;
-      this.max = kind === "read" ? 8000 : 10000;
-      this.good = 0;
-      this.blocked = 0;
-      this.proactiveDelay = 0;
-      this.proactiveUntil = 0;
-    }
-    effectiveDelay() {
-      if (this.proactiveUntil && Date.now() >= this.proactiveUntil) {
-        this.proactiveDelay = 0;
-        this.proactiveUntil = 0;
+    constructor(kind, saved = {}) {
+      const now = Date.now();
+      this.kind = kind;
+      const fresh = pacingNumber(saved.updatedAt) != null && now - saved.updatedAt <= PACING_TTL;
+      const savedSafe = fresh ? pacingNumber(saved.safeDelay) : null;
+      const savedCurrent = fresh ? pacingNumber(saved.currentDelay ?? saved.delay) : null;
+      const start = pacingStart(kind);
+      this.safeDelay = pacingClamp(savedSafe ?? start, pacingFloor(kind), 30000);
+      if (fresh && savedSafe != null && now - saved.updatedAt <= PACING_DAY) {
+        this.currentDelay = pacingClamp(savedCurrent ?? this.safeDelay, pacingFloor(kind), 30000);
+      } else {
+        this.currentDelay = Math.max(start, this.safeDelay);
       }
-      return Math.max(this.delay, this.proactiveDelay || 0);
+      this.unsafeDelay = fresh ? pacingNumber(saved.unsafeDelay) : null;
+      if (this.unsafeDelay != null && this.unsafeDelay >= this.safeDelay) this.unsafeDelay = null;
+      this.blocked = fresh ? pacingNumber(saved.blocked) ?? 0 : 0;
+      this.nextAt = 0;
+      this.resetAt = fresh ? pacingNumber(saved.resetAt) ?? 0 : 0;
+      this.headerDelay = fresh ? pacingNumber(saved.headerDelay) ?? 0 : 0;
+      this.lastLimited = fresh ? pacingNumber(saved.lastLimited) ?? 0 : 0;
+      this.probeFreezeUntil = fresh ? pacingNumber(saved.probeFreezeUntil) ?? 0 : 0;
+      this.confidence = pacingClamp(pacingNumber(saved.confidence) ?? (savedSafe != null ? 0.55 : 0.35), 0, 1);
+      this.cleanSuccesses = 0;
+      this.firstCleanAt = 0;
+      this.probing = false;
+      this.probeStartedAt = 0;
+      this.probeSuccesses = 0;
+      this.previousSafe = this.safeDelay;
+      this.limitTimes = Array.isArray(saved.limitTimes) ? saved.limitTimes.filter(time => Number.isFinite(time) && time > now - 600000) : [];
+      this.updatedAt = now;
     }
-    success() {
-      if (++this.good >= 8) {
-        this.delay = Math.max(this.min, Math.floor(this.delay * 0.9));
-        this.good = 0;
+    effectiveDelay(now = Date.now()) {
+      return Math.max(this.currentDelay, now < this.resetAt ? this.headerDelay : 0);
+    }
+    observe(response, now = Date.now()) {
+      const remaining = pacingNumber(responseHeader(response, "X-RateLimit-Remaining"));
+      const window = pacingWindow(response, now);
+      if (remaining == null || window == null) return false;
+      this.resetAt = now + window;
+      this.headerDelay = remaining > 0 ? Math.min(window + PACING_BUFFER, Math.ceil((window / remaining) * 1.15)) : 0;
+      if (remaining === 0) this.blocked = Math.max(this.blocked, now + window + PACING_BUFFER);
+      this.confidence = Math.min(1, this.confidence + 0.015);
+      this.updatedAt = now;
+      return true;
+    }
+    candidate() {
+      const floor = pacingFloor(this.kind);
+      if (this.unsafeDelay != null && this.unsafeDelay < this.safeDelay) {
+        const gap = this.safeDelay - this.unsafeDelay;
+        return Math.max(floor, Math.ceil(this.safeDelay - gap * 0.35));
       }
+      return Math.max(floor, Math.ceil(this.safeDelay * (this.kind === "read" ? 0.90 : 0.92)));
     }
-    observe(response) {
-      const remaining = Number(responseHeader(response, "X-RateLimit-Remaining"));
-      const resetAfter = Number(responseHeader(response, "X-RateLimit-Reset-After"));
-      const resetEpoch = Number(responseHeader(response, "X-RateLimit-Reset"));
-      let windowMs = Number.isFinite(resetAfter) && resetAfter >= 0
-        ? Math.ceil(resetAfter * 1000)
-        : Number.isFinite(resetEpoch) && resetEpoch > 0
-          ? Math.max(0, Math.ceil(resetEpoch * 1000 - Date.now()))
-          : 0;
-
-      if (Number.isFinite(remaining) && windowMs > 0) {
-        if (remaining <= 0) {
-          this.blocked = Math.max(this.blocked, Date.now() + windowMs + 75);
-          this.proactiveDelay = 0;
-          this.proactiveUntil = 0;
-        } else {
-          const sustainable = Math.ceil(windowMs / remaining);
-          this.proactiveDelay = Math.min(this.max, Math.max(this.min, sustainable));
-          this.proactiveUntil = Date.now() + windowMs;
+    maybeProbe(now = Date.now()) {
+      if (this.probing || now < this.probeFreezeUntil || now - this.lastLimited < PROBE_FREEZE) return;
+      if (this.cleanSuccesses < PROBE_ARM_SUCCESSES || !this.firstCleanAt || now - this.firstCleanAt < 60000) return;
+      const next = this.candidate();
+      if (next >= this.safeDelay - 20) return;
+      this.previousSafe = this.safeDelay;
+      this.currentDelay = next;
+      this.probing = true;
+      this.probeStartedAt = now;
+      this.probeSuccesses = 0;
+      this.cleanSuccesses = 0;
+      this.firstCleanAt = 0;
+      this.updatedAt = now;
+    }
+    success(headersAvailable, now = Date.now()) {
+      if (headersAvailable) {
+        this.cleanSuccesses++;
+        this.updatedAt = now;
+        return;
+      }
+      if (!this.firstCleanAt) this.firstCleanAt = now;
+      this.cleanSuccesses++;
+      if (this.probing) {
+        this.probeSuccesses++;
+        if (this.probeSuccesses >= PROBE_ACCEPT_SUCCESSES && now - this.probeStartedAt >= PROBE_ACCEPT_MS) {
+          this.safeDelay = this.currentDelay;
+          this.previousSafe = this.safeDelay;
+          this.probing = false;
+          this.probeSuccesses = 0;
+          this.cleanSuccesses = 0;
+          this.firstCleanAt = 0;
+          this.confidence = Math.min(1, this.confidence + 0.12);
+          this.probeFreezeUntil = now + 60000;
         }
+      } else {
+        this.maybeProbe(now);
+      }
+      this.updatedAt = now;
+    }
+    limited(ms, scope = "route", now = Date.now()) {
+      this.limitTimes = this.limitTimes.filter(time => time > now - 600000);
+      this.limitTimes.push(now);
+      const wasProbe = this.probing;
+      const limitedDelay = this.currentDelay;
+      this.unsafeDelay = Math.max(this.unsafeDelay ?? 0, limitedDelay);
+      if (wasProbe) {
+        this.currentDelay = Math.max(this.previousSafe, this.safeDelay);
+      } else {
+        this.safeDelay = Math.min(30000, Math.max(pacingStart(this.kind), Math.ceil(limitedDelay * (this.limitTimes.length >= 3 ? 1.18 : 1.10))));
+        this.currentDelay = this.safeDelay;
+      }
+      this.probing = false;
+      this.probeSuccesses = 0;
+      this.cleanSuccesses = 0;
+      this.firstCleanAt = 0;
+      this.lastLimited = now;
+      const freeze = this.limitTimes.length >= 3 ? 1800000 : PROBE_FREEZE;
+      this.probeFreezeUntil = Math.max(this.probeFreezeUntil, now + freeze);
+      const drain = scope === "shared" ? 5000 : scope === "global" ? 2500 : 1000;
+      this.blocked = Math.max(this.blocked, now + ms + PACING_BUFFER, now + drain);
+      this.confidence = Math.max(0.1, this.confidence - (wasProbe ? 0.08 : 0.18));
+      this.updatedAt = now;
+    }
+    mode(now = Date.now()) {
+      if (now < this.blocked) return "cooldown";
+      if (this.probing) return "probing";
+      if (now < this.probeFreezeUntil) return "stabilizing";
+      return this.confidence >= 0.7 ? "learned" : "learning";
+    }
+    snapshot() {
+      return {
+        kind: this.kind, safeDelay: this.safeDelay, currentDelay: this.currentDelay,
+        unsafeDelay: this.unsafeDelay, blocked: this.blocked, resetAt: this.resetAt,
+        headerDelay: this.headerDelay, lastLimited: this.lastLimited,
+        probeFreezeUntil: this.probeFreezeUntil, confidence: this.confidence,
+        limitTimes: this.limitTimes, updatedAt: this.updatedAt,
+      };
+    }
+  }
+
+  class SharedResourceGovernor {
+    constructor(saved = {}) {
+      const now = Date.now(), fresh = pacingNumber(saved.updatedAt) != null && now - saved.updatedAt <= PACING_TTL;
+      this.starts = fresh && Array.isArray(saved.starts) ? saved.starts.filter(t => Number.isFinite(t) && t > now - 120000) : [];
+      this.blocked = fresh ? pacingNumber(saved.blocked) ?? 0 : 0;
+      this.safe = fresh ? pacingNumber(saved.safe) : 28;
+      if (this.safe == null) this.safe = 28;
+      this.safe = Math.min(30, Math.max(1, this.safe));
+      this.unsafe = fresh ? pacingNumber(saved.unsafe) : null;
+      this.probe = null; this.proven = fresh && saved.proven === true;
+      this.confidence = pacingClamp(pacingNumber(saved.confidence) ?? (this.proven ? .75 : .25), 0, 1);
+      this.lastLimited = fresh ? pacingNumber(saved.lastLimited) ?? 0 : 0;
+      this.freezeUntil = fresh ? pacingNumber(saved.freezeUntil) ?? 0 : 0;
+      this.clean = 0; this.firstClean = 0; this.probeStarted = 0; this.probeGood = 0; this.updatedAt = now;
+    }
+    trim(now = Date.now()) { this.starts = this.starts.filter(t => t > now - 120000); }
+    started(now = Date.now()) { this.trim(now); this.starts.push(now); this.updatedAt = now; }
+    cap() { return Math.min(30, this.probe ?? this.safe ?? 28); }
+    next(now = Date.now()) {
+      let d = this.blocked, cap = this.cap(); if (cap == null || cap < 1) return d;
+      const a = this.starts.filter(t => t > now - 60000).sort((x,y)=>x-y);
+      const gap = Math.ceil(60000 / cap);
+      if (a.length) d = Math.max(d, a[a.length - 1] + gap);
+      if (a.length >= cap) d = Math.max(d, a[Math.max(0, a.length - Math.floor(cap))] + 60000 + PACING_BUFFER);
+      return d;
+    }
+    infer(now = Date.now()) {
+      this.trim(now); const a = this.starts.filter(t => t > now - 60000).sort((x,y)=>x-y);
+      if (a.length < 12) return null; const span = Math.max(1, now - a[0]); if (span < 30000) return null;
+      return Math.max(a.length, Math.ceil(a.length * 60000 / Math.min(60000, span)));
+    }
+    maybeProbe(now = Date.now()) {
+      if (!this.proven || this.probe != null || now < this.freezeUntil || now - this.lastLimited < PROBE_FREEZE || this.safe == null || this.clean < 60 || !this.firstClean || now - this.firstClean < 90000) return;
+      let n = Math.min(30, this.safe + 1);
+      if (this.unsafe != null) n = Math.min(n, this.unsafe - 1);
+      if (n <= this.safe) return; this.probe = n; this.probeStarted = now; this.probeGood = 0; this.clean = 0; this.firstClean = 0; this.updatedAt = now;
+    }
+    success(now = Date.now()) {
+      if (this.safe == null) return; if (!this.firstClean) this.firstClean = now; this.clean++;
+      if (!this.proven) {
+        if (this.clean >= 60 && now - this.firstClean >= 120000) { this.proven = true; this.confidence = Math.max(this.confidence,.72); this.clean=0; this.firstClean=0; this.freezeUntil=Math.max(this.freezeUntil,now+60000); }
+      } else if (this.probe != null) {
+        this.probeGood++; if (this.probeGood >= 60 && now - this.probeStarted >= 120000) { this.safe=this.probe; this.probe=null; this.probeGood=0; this.clean=0; this.firstClean=0; this.confidence=Math.min(1,this.confidence+.1); this.freezeUntil=now+60000; }
+      } else this.maybeProbe(now);
+      this.updatedAt = now;
+    }
+    limited(ms, now = Date.now()) {
+      const probing = this.probe, inferred = this.infer(now);
+      if (probing != null) this.unsafe = this.unsafe == null ? probing : Math.min(this.unsafe, probing);
+      else if (inferred != null) this.unsafe = this.unsafe == null ? inferred : Math.min(this.unsafe, inferred);
+      if (this.safe == null) { const u=this.unsafe ?? inferred; if (u != null) this.safe=Math.max(1,Math.floor((u-1)*.80)); }
+      else if (probing == null) { const c=this.unsafe==null?this.safe:Math.min(this.safe,this.unsafe-1); this.safe=Math.max(1,Math.floor(c*.90)); }
+      this.probe=null; this.probeGood=0; this.clean=0; this.firstClean=0; this.proven=false; this.lastLimited=now; this.freezeUntil=Math.max(this.freezeUntil,now+PROBE_FREEZE); this.confidence=Math.max(.1,this.confidence-.15);
+      this.blocked=Math.max(this.blocked,now+ms+PACING_BUFFER,now+5000,this.next(now)); this.updatedAt=now;
+    }
+    mode(now = Date.now()) { return now<this.blocked?"cooldown":this.probe!=null?"probing":now<this.freezeUntil?"stabilizing":this.proven?"learned":this.safe==null?"observing":"learning"; }
+    snapshot() { return { starts:this.starts, blocked:this.blocked, safe:this.safe, unsafe:this.unsafe, proven:this.proven, confidence:this.confidence, lastLimited:this.lastLimited, freezeUntil:this.freezeUntil, updatedAt:this.updatedAt }; }
+  }
+
+  class PurgeMetrics {
+    constructor(rate) {
+      this.rate = rate;
+      this.startedAt = Date.now();
+      this.finishedAt = 0;
+      this.requests = [];
+      this.deletions = [];
+      this.reactionEvents = [];
+      this.workEvents = [];
+      this.responses = {};
+      this.routes = {};
+      this.limitEvents = [];
+      this.rateLimits = 0;
+      this.transientErrors = 0;
+      this.recoveredTransientRequests = 0;
+      this.headersSeen = 0;
+      this.requestCount = 0;
+      this.networkMs = {};
+      this.pacingMs = {};
+      this.observedLimits = {};
+      this.inFlightAt = 0;
+      this.inFlightOperation = "";
+      this.inFlightCount = 0;
+      this.pending = null;
+      this.workTotal = 0;
+      this.workDone = 0;
+      this.workMessagesTotal = 0;
+      this.workMessagesDone = 0;
+      this.workReactionsTotal = 0;
+      this.workReactionsDone = 0;
+      this.workActive = false;
+      this.workStartedAt = 0;
+      this.waitUntil = 0;
+      this.waitKind = "";
+      this.waitStarted = 0;
+      this.waitTotals = { pacing: 0, cooldown: 0, indexing: 0, transient: 0 };
+      this.indexWaits = 0;
+      this.lastSavedAt = 0;
+      this.lastSavedLimits = 0;
+    }
+    request(operation) {
+      const now = Date.now();
+      this.requests.push(now);
+      this.requests = this.requests.filter(time => time > now - 3600000);
+      this.requestCount++;
+      this.routes[operation] = (this.routes[operation] ?? 0) + 1;
+      this.inFlightCount++;
+      if (!this.inFlightAt) this.inFlightAt = now;
+      this.inFlightOperation = operation;
+    }
+    response(operation, status, duration, response) {
+      this.inFlightCount = Math.max(0, this.inFlightCount - 1);
+      if (!this.inFlightCount) this.inFlightAt = 0;
+      this.responses[status] = (this.responses[status] ?? 0) + 1;
+      if (status >= 200 && status < 300) {
+        this.networkMs[operation] = this.networkMs[operation] == null ? duration : this.networkMs[operation] * 0.8 + duration * 0.2;
+      }
+      if (pacingNumber(responseHeader(response, "X-RateLimit-Remaining")) != null) {
+        this.headersSeen++;
+        this.observedLimits[operation] = {
+          limit: pacingNumber(responseHeader(response, "X-RateLimit-Limit")),
+          remaining: pacingNumber(responseHeader(response, "X-RateLimit-Remaining")),
+          reset_after_s: pacingNumber(responseHeader(response, "X-RateLimit-Reset-After")),
+        };
       }
     }
-    limited(ms) {
-      this.good = 0;
-      this.proactiveDelay = 0;
-      this.proactiveUntil = 0;
-      this.delay = Math.min(this.max, Math.max(this.delay + 100, Math.ceil(this.delay * 1.6), ms + 100));
-      this.blocked = Math.max(this.blocked, Date.now() + ms + 100);
+    observePace(operation, delay) {
+      this.pacingMs[operation] = this.pacingMs[operation] == null ? delay : this.pacingMs[operation] * 0.9 + delay * 0.1;
+    }
+    limit(operation, scope, ms, response, lane) {
+      this.rateLimits++;
+      this.limitEvents.push({
+        elapsed_s: Math.round((Date.now() - this.startedAt) / 1000), operation, scope,
+        retry_after_s: ms / 1000, pacing_ms: Math.ceil(lane.currentDelay), route_pacing_ms: Math.ceil(lane.currentDelay),
+        effective_pacing_ms: Math.ceil(Math.max(lane.effectiveDelay(), this.rate.activeResource?.cap() ? 60000 / this.rate.activeResource.cap() : 0)),
+        shared_safe_per_min: this.rate.activeResource?.safe == null ? null : Math.floor(this.rate.activeResource.safe),
+        safe_ms: Math.ceil(lane.safeDelay), unsafe_ms: lane.unsafeDelay == null ? null : Math.ceil(lane.unsafeDelay),
+        controller_mode: lane.mode(),
+        limit: pacingNumber(responseHeader(response, "X-RateLimit-Limit")),
+        remaining: pacingNumber(responseHeader(response, "X-RateLimit-Remaining")),
+        reset_after_s: pacingNumber(responseHeader(response, "X-RateLimit-Reset-After")),
+      });
+      this.limitEvents = this.limitEvents.slice(-30);
+    }
+    beginWait(kind, until) {
+      this.endWait();
+      this.waitKind = kind;
+      this.waitUntil = until;
+      this.waitStarted = Date.now();
+    }
+    endWait() {
+      if (this.waitStarted && this.waitKind in this.waitTotals) {
+        this.waitTotals[this.waitKind] += Math.max(0, Math.min(Date.now(), this.waitUntil) - this.waitStarted);
+      }
+      this.waitStarted = 0;
+      this.waitUntil = 0;
+      this.waitKind = "";
+    }
+    messagePlan(messages, target) {
+      const plan = { delete: 0, "bulk-delete": 0, reaction: 0 };
+      const groups = new Map();
+      for (const message of messages) {
+        if (target.strictOrder !== true && message.moderation && isBulkRecent(message.messageId)) {
+          groups.set(message.channelId, (groups.get(message.channelId) ?? 0) + 1);
+        } else plan.delete++;
+      }
+      for (const size of groups.values()) {
+        plan["bulk-delete"] += Math.floor(size / BULK_MAX);
+        const remainder = size % BULK_MAX;
+        if (remainder === 1) plan.delete++;
+        else if (remainder > 1) plan["bulk-delete"]++;
+      }
+      return plan;
+    }
+    beginWork(found, target, verify) {
+      this.pending = this.messagePlan(found.messages, target);
+      this.pending.reaction = found.reactions.length;
+      this.workTotal = found.messages.length + found.reactions.length;
+      this.workDone = 0;
+      this.workMessagesTotal = found.messages.length;
+      this.workMessagesDone = 0;
+      this.workReactionsTotal = found.reactions.length;
+      this.workReactionsDone = 0;
+      this.workActive = true;
+      this.workStartedAt = Date.now();
+      this.workEvents = [];
+      this.verificationWork = !!verify;
+      notify();
+    }
+    recordWork(units) {
+      const now = Date.now();
+      if (units > 0) this.workEvents.push({ time: now, units });
+      this.workEvents = this.workEvents.filter(item => item.time > now - 300000);
+    }
+    finishTask(operation, units, deleted = false) {
+      if (this.pending) this.pending[operation] = Math.max(0, (this.pending[operation] ?? 0) - 1);
+      this.workDone += units;
+      if (operation === "reaction") { this.workReactionsDone += units; this.reactionEvents.push({ time: Date.now(), units }); }
+      else this.workMessagesDone += units;
+      this.recordWork(units);
+      if (deleted) this.deletions.push({ time: Date.now(), units });
+      this.deletions = this.deletions.filter(item => item.time > Date.now() - 60000);
+      this.reactionEvents = this.reactionEvents.filter(item => item.time > Date.now() - 60000);
+    }
+    skipMessages(messages, target) {
+      const plan = this.messagePlan(messages, target);
+      if (this.pending) for (const key of Object.keys(plan)) this.pending[key] = Math.max(0, this.pending[key] - plan[key]);
+      this.workDone += messages.length;
+      this.workMessagesDone += messages.length;
+      this.recordWork(messages.length);
+    }
+    fallbackBatch(size) {
+      if (!this.pending) return;
+      this.pending["bulk-delete"] = Math.max(0, this.pending["bulk-delete"] - 1);
+      this.pending.delete += size;
+    }
+    endWork() { this.workActive = false; this.pending = null; notify(); }
+    queueEta(now = Date.now()) {
+      if (!this.workActive || !this.pending) return null;
+      let ms = 0;
+      for (const [operation, count] of Object.entries(this.pending)) {
+        ms += count * Math.max(this.rate.operationDelay(operation), this.networkMs[operation] ?? 0);
+      }
+      const cooldown = Math.max(this.rate.globalUntil, this.rate.activeLane?.blocked ?? 0, this.waitKind === "cooldown" ? this.waitUntil : 0);
+      return Math.ceil(ms + Math.max(0, cooldown - now));
+    }
+    empiricalEta(now = Date.now()) {
+      if (!this.workActive || this.workDone <= 0) return null;
+      const windowStart = Math.max(this.workStartedAt, now - 180000);
+      const recent = this.workEvents.filter(item => item.time >= windowStart);
+      const units = recent.reduce((sum, item) => sum + item.units, 0);
+      const elapsed = Math.max(1, now - windowStart);
+      if (units < 20 || elapsed < 30000) return null;
+      const perMs = units / elapsed;
+      const remaining = Math.max(0, this.workTotal - this.workDone);
+      return perMs > 0 ? Math.ceil(remaining / perMs) : null;
+    }
+    eta(now = Date.now()) {
+      const queue = this.queueEta(now);
+      const empirical = this.empiricalEta(now);
+      if (queue == null) return empirical;
+      if (empirical == null) return queue;
+      const weight = Math.min(0.7, Math.max(0.25, this.workDone / Math.max(1, this.workTotal)));
+      return Math.ceil(queue * (1 - weight) + empirical * weight);
+    }
+    etaRange(now = Date.now()) {
+      const best = this.eta(now);
+      if (best == null) return null;
+      const sample = this.workEvents.reduce((sum, item) => sum + item.units, 0);
+      const recentLimit = this.rate.limitTimes.some(time => time > now - 600000);
+      const confidence = pacingClamp(0.35 + Math.min(0.45, sample / 250) - (recentLimit ? 0.15 : 0), 0.2, 0.9);
+      const spread = 0.35 - confidence * 0.22;
+      return { best, low: Math.max(0, Math.floor(best * (1 - spread))), high: Math.ceil(best * (1 + spread * 1.5)), confidence };
+    }
+    report() {
+      const now = this.finishedAt || Date.now();
+      const requestCountSince = ms => this.requests.filter(time => time > now - ms).length;
+      const deletedLastMinute = this.deletions.filter(item => item.time > now - 60000).reduce((sum, item) => sum + item.units, 0);
+      const reactionsProcessedLastMinute = this.reactionEvents.filter(item => item.time > now - 60000).reduce((sum, item) => sum + item.units, 0);
+      const range = this.etaRange(now);
+      const lane = this.rate.activeLane;
+      return {
+        plugin_version: PLUGIN_VERSION, report_version: 3, phase: progress.phase,
+        elapsed_s: Math.round((now - this.startedAt) / 1000),
+        requests: this.requestCount,
+        requests_last_1s: requestCountSince(1000), requests_last_60s: requestCountSince(60000), requests_last_3600s: requestCountSince(3600000),
+        responses: { ...this.responses }, operations: { ...this.routes }, rate_limits: this.rateLimits,
+        transient_errors: this.transientErrors, recovered_transient_requests: this.recoveredTransientRequests,
+        unresolved_failures: progress.failed, recovered_failures: progress.recoveredFailures ?? 0,
+        observed_limits: clone(this.observedLimits),
+        average_response_ms: Object.fromEntries(Object.entries(this.networkMs).map(([key, ms]) => [key, Math.round(ms)])),
+        in_flight_s: this.inFlightAt ? Math.round((now - this.inFlightAt) / 1000) : 0,
+        in_flight_requests: this.inFlightCount,
+        responses_with_rate_headers: this.headersSeen, search_index_waits: this.indexWaits,
+        wait_seconds: Object.fromEntries(Object.entries(this.waitTotals).map(([key, ms]) => [key, Math.round(ms / 1000)])),
+        messages_deleted: progress.messagesDeleted, reactions_removed: progress.reactionsRemoved,
+        deleted_last_60s: deletedLastMinute, reactions_processed_last_60s: reactionsProcessedLastMinute, skipped: progress.skipped, failed: progress.failed,
+        pages: progress.pages, messages_examined: progress.scanned, permission_skips: progress.permissionSkipped,
+        current_target_total: this.workTotal, current_target_processed: this.workDone,
+        current_target_messages_total: this.workMessagesTotal, current_target_messages_processed: this.workMessagesDone,
+        current_target_reactions_total: this.workReactionsTotal, current_target_reactions_processed: this.workReactionsDone,
+        cleanup_eta_s: range == null ? null : Math.ceil(range.best / 1000),
+        cleanup_eta_low_s: range == null ? null : Math.ceil(range.low / 1000),
+        cleanup_eta_high_s: range == null ? null : Math.ceil(range.high / 1000),
+        eta_confidence: range == null ? null : Number(range.confidence.toFixed(2)),
+        route_pacing_ms: Math.ceil(lane?.effectiveDelay(now) ?? pacingStart("modify")),
+        effective_pacing_ms: Math.ceil(Math.max(lane?.effectiveDelay(now) ?? pacingStart("modify"), this.rate.activeResource?.cap() ? 60000/this.rate.activeResource.cap() : 0)),
+        current_pacing_ms: Math.ceil(Math.max(lane?.effectiveDelay(now) ?? pacingStart("modify"), this.rate.activeResource?.cap() ? 60000/this.rate.activeResource.cap() : 0)),
+        shared_hard_cap_per_min: 30,
+        shared_bottleneck: !!(this.rate.activeResource?.cap() && 60000/this.rate.activeResource.cap() > (lane?.effectiveDelay(now) ?? pacingStart("modify")) + 50),
+        controller_mode: this.rate.activeResource?.safe != null ? this.rate.activeResource.mode(now) : lane?.mode(now) ?? "initializing",
+        learned_safe_ms: lane ? Math.ceil(lane.safeDelay) : null,
+        known_unsafe_ms: lane?.unsafeDelay == null ? null : Math.ceil(lane.unsafeDelay),
+        learning_confidence: lane ? Number(lane.confidence.toFixed(2)) : null,
+        probe_successes: this.rate.activeResource?.probe != null ? this.rate.activeResource.probeGood : lane?.probing ? lane.probeSuccesses : 0,
+        shared_safe_per_min: this.rate.activeResource?.safe == null ? null : Math.floor(this.rate.activeResource.safe),
+        shared_unsafe_per_min: this.rate.activeResource?.unsafe == null ? null : Math.floor(this.rate.activeResource.unsafe),
+        shared_controller_mode: this.rate.activeResource?.mode(now) ?? "observing",
+        limits_last_10m: this.rate.limitTimes.filter(time => time > now - 600000).length,
+        active_resource_lanes: this.rate.resources.size,
+        wait_reason: this.waitKind || null,
+        cooldown_remaining_s: Math.ceil(Math.max(0, this.rate.globalUntil - now, (lane?.blocked ?? 0) - now, (this.rate.activeResource?.blocked ?? 0) - now) / 1000),
+        recent_limits: this.limitEvents.map(event => ({ ...event })),
+      };
+    }
+    saveReport() {
+      if (purgeAccountId() === this.rate.accountId) {
+        const reports = { ...(storage.shiggyPurgeTestReports ?? {}) };
+        reports[this.rate.accountId] = this.report();
+        storage.shiggyPurgeTestReports = reports;
+        this.lastSavedAt = Date.now();
+        this.lastSavedLimits = this.rateLimits;
+      }
+    }
+    finish() {
+      this.endWait();
+      this.finishedAt = Date.now();
+      this.rate.persist();
+      this.saveReport();
     }
   }
 
   class RateController {
-    constructor(control) { this.control = control; this.lanes = new Map(); this.globalUntil = 0; }
-    lane(key, kind) {
-      if (!this.lanes.has(key)) this.lanes.set(key, new RateLane(kind));
-      return this.lanes.get(key);
-    }
-    async run(key, kind, fn) {
-      const lane = this.lane(key, kind);
-      for (;;) {
-        await this.control.check();
-        const wait = Math.max(lane.effectiveDelay(), lane.blocked - Date.now(), this.globalUntil - Date.now(), 0);
-        if (wait) { setProgress({ waitMs: wait }); await this.control.wait(wait); }
-        try {
-          const response = await fn();
-          lane.success();
-          lane.observe(response);
-          setProgress({ waitMs: 0 });
-          return response;
-        } catch (error) {
-          const responseBody = error?.body ?? error?.response?.body;
-          const status = error?.status ?? error?.response?.status;
-          const retryRaw = responseBody?.retry_after ?? error?.retry_after ?? responseHeader(error, "Retry-After");
-          const retry = Number.isFinite(Number(retryRaw)) ? Math.ceil(Number(retryRaw) * 1000) : undefined;
-          if (status !== 429 && retry === undefined) throw error;
-          const ms = retry ?? 1000;
-          const globalHeader = String(responseHeader(error, "X-RateLimit-Global") ?? "").toLowerCase() === "true";
-          if (responseBody?.global || error?.global || globalHeader) this.globalUntil = Math.max(this.globalUntil, Date.now() + ms + 100);
-          lane.limited(ms);
-          setProgress({
-            waitMs: ms,
-            status: responseBody?.global || error?.global || globalHeader
-              ? "Global Discord rate limit; continuing automatically..."
-              : "Discord rate limit; continuing automatically...",
-          });
+    constructor(control) {
+      this.control = control;
+      this.accountId = control.accountId;
+      const state = storage.shiggyPurgePacing?.[this.accountId];
+      const saved = state?.version === PACING_VERSION ? state : {};
+      this.lanes = new Map();
+      this.aliases = new Map();
+      this.resources = new Map();
+      for (const [key, value] of Object.entries(saved.lanes ?? {})) {
+        if (value?.updatedAt > Date.now() - PACING_TTL || value?.blocked > Date.now()) {
+          this.lanes.set(key, new RateLane(value.kind === "read" ? "read" : "modify", value));
         }
       }
+      for (const [key, value] of Object.entries(saved.aliases ?? {})) if (this.lanes.has(value)) this.aliases.set(key, value);
+      for (const [key, value] of Object.entries(saved.resources ?? {})) if (value?.updatedAt > Date.now() - PACING_TTL || value?.blocked > Date.now()) this.resources.set(key, new SharedResourceGovernor(value));
+      this.globalUntil = pacingNumber(saved.globalUntil) ?? 0;
+      this.globalNextAt = 0;
+      this.limitTimes = Array.isArray(saved.limitTimes) ? saved.limitTimes.filter(time => Number.isFinite(time) && time > Date.now() - 600000) : [];
+      this.holdReason = typeof saved.holdReason === "string" ? saved.holdReason : "";
+      this.activeLane = null;
+      this.activeResource = null;
+      this.operationLanes = new Map();
+      this.resourceQueues = new Map();
+      this.startGate = Promise.resolve();
+      this.metrics = new PurgeMetrics(this);
+      if (this.holdReason) control.pause(this.holdReason);
     }
+    resource(identity) { if (!this.resources.has(identity.major)) this.resources.set(identity.major, new SharedResourceGovernor()); return this.resources.get(identity.major); }
+    lane(identity, kind) {
+      const key = this.aliases.get(identity.key) ?? identity.key;
+      if (!this.lanes.has(key)) this.lanes.set(key, new RateLane(kind));
+      const lane = this.lanes.get(key);
+      if (kind === "modify") lane.kind = "modify";
+      this.operationLanes.set(identity.operation, lane);
+      return lane;
+    }
+    mergeLane(target, source) {
+      target.safeDelay = Math.max(target.safeDelay, source.safeDelay);
+      target.currentDelay = Math.max(target.currentDelay, source.currentDelay);
+      if (source.unsafeDelay != null) target.unsafeDelay = Math.max(target.unsafeDelay ?? 0, source.unsafeDelay);
+      target.blocked = Math.max(target.blocked, source.blocked);
+      target.resetAt = Math.max(target.resetAt, source.resetAt);
+      target.headerDelay = Math.max(target.headerDelay, source.headerDelay);
+      target.lastLimited = Math.max(target.lastLimited, source.lastLimited);
+      target.probeFreezeUntil = Math.max(target.probeFreezeUntil, source.probeFreezeUntil);
+      target.confidence = Math.min(target.confidence, source.confidence);
+      target.updatedAt = Date.now();
+      return target;
+    }
+    bind(identity, kind, response, lane) {
+      const bucket = responseHeader(response, "X-RateLimit-Bucket");
+      if (!bucket) return lane;
+      const key = `bucket:${String(bucket)}:${identity.major}`;
+      const previousKey = this.aliases.get(identity.key);
+      const shared = this.lanes.get(key);
+      if (shared && shared !== lane) lane = this.mergeLane(shared, lane);
+      else if (!shared && previousKey && previousKey !== key) lane = new RateLane(kind, lane.snapshot());
+      this.lanes.set(key, lane);
+      this.aliases.set(identity.key, key);
+      this.operationLanes.set(identity.operation, lane);
+      return lane;
+    }
+    operationDelay(operation) {
+      const c=this.activeResource?.cap(); return Math.max(this.operationLanes.get(operation)?.effectiveDelay() ?? pacingStart("modify"), this.metrics.pacingMs[operation] ?? 0, c ? 60000/c : 0);
+    }
+    persist() {
+      const all = { ...(storage.shiggyPurgePacing ?? {}) };
+      all[this.accountId] = {
+        version: PACING_VERSION, updatedAt: Date.now(), globalUntil: this.globalUntil,
+        holdReason: this.holdReason, limitTimes: this.limitTimes,
+        aliases: Object.fromEntries(this.aliases),
+        lanes: Object.fromEntries([...this.lanes.entries()].map(([key, lane]) => [key, lane.snapshot()])),
+        resources: Object.fromEntries([...this.resources.entries()].map(([key, resource]) => [key, resource.snapshot()])),
+      };
+      storage.shiggyPurgePacing = clone(all);
+      if (this.metrics && (Date.now() - this.metrics.lastSavedAt >= 30000 || this.control.paused || this.metrics.lastSavedLimits !== this.metrics.rateLimits)) this.metrics.saveReport();
+    }
+    releaseHold() {
+      this.holdReason = "";
+      this.longWaitAcknowledged = Math.max(this.globalUntil, ...[...this.lanes.values()].map(lane => lane.blocked));
+      this.persist();
+    }
+    hold(reason) { this.holdReason = reason; this.control.pause(reason); this.persist(); }
+    reserveGlobal() {
+      const task = this.startGate.then(async () => {
+        await this.control.check();
+        const now = Date.now();
+        const deadline = Math.max(this.globalUntil, this.globalNextAt);
+        if (deadline > now) await this.control.wait(deadline - now);
+        await this.control.check();
+        this.globalNextAt = Date.now() + GLOBAL_START_GAP;
+      });
+      this.startGate = task.catch(() => {});
+      return task;
+    }
+    run(key, kind, fn, url) {
+      const identity = pacingIdentity(key, kind, url);
+      const queueKey = identity.major;
+      const previous = this.resourceQueues.get(queueKey) ?? Promise.resolve();
+      const pending = previous.then(() => this.runRequest(identity, kind, fn));
+      const tail = pending.catch(() => {});
+      this.resourceQueues.set(queueKey, tail);
+      pending.finally(() => {
+        if (this.resourceQueues.get(queueKey) === tail) this.resourceQueues.delete(queueKey);
+      }).catch(() => {});
+      return pending;
+    }
+    async runRequest(identity, kind, fn) {
+      let lane = this.lane(identity, kind);
+      const resource = this.resource(identity);
+      let transientAttempts = 0;
+      for (;;) {
+        await this.control.check();
+        this.activeLane = lane; this.activeResource = resource;
+        const now = Date.now();
+        const hardBlocked = Math.max(lane.blocked, resource.blocked, this.globalUntil);
+        const deadline = Math.max(lane.nextAt, hardBlocked, resource.next(now));
+        if (deadline > now) {
+          const reason = hardBlocked > now ? "cooldown" : "pacing";
+          this.metrics.beginWait(reason, deadline);
+          setProgress({ waitMs: deadline - now });
+          if (hardBlocked - now >= PACING_LONG_WAIT && !this.control.paused && hardBlocked > (this.longWaitAcknowledged ?? 0)) {
+            this.longWaitAcknowledged = hardBlocked;
+            this.hold(`Long Discord cooldown. Paused; requests can resume after ${new Date(hardBlocked).toLocaleTimeString()}.`);
+          }
+          await this.control.wait(deadline - now);
+          this.metrics.endWait();
+          continue;
+        }
+        await this.reserveGlobal();
+        await this.control.check();
+        const afterGate = Date.now();
+        const changedBlock = Math.max(lane.blocked, resource.blocked, resource.next(afterGate), this.globalUntil);
+        if (changedBlock > afterGate) continue;
+        this.metrics.endWait();
+        setProgress({ waitMs: 0 });
+        const requestStart = Date.now();
+        resource.started(requestStart);
+        this.metrics.request(identity.operation);
+        let response;
+        try {
+          response = await fn();
+          const status = Number(response?.status ?? 200);
+          if (status >= 400) throw response;
+        } catch (error) {
+          const status = Number(error?.status ?? error?.response?.status ?? 0);
+          this.metrics.response(identity.operation, status, Date.now() - requestStart, error);
+          lane = this.bind(identity, kind, error, lane);
+          this.activeLane = lane;
+          const headersAvailable = lane.observe(error);
+          if (status === 401 || status === 403) {
+            this.control.failure = pacingStop(status === 401
+              ? "Discord authentication failed; stopped and kept the resume checkpoint"
+              : "Discord denied permission; stopped and kept the resume checkpoint");
+            this.persist();
+            throw this.control.failure;
+          }
+          const transient = status >= 500 && status <= 599;
+          if (transient) this.metrics.transientErrors++;
+          if (status !== 429) {
+            if (transient && transientAttempts < TRANSIENT_RETRIES) {
+              transientAttempts++;
+              const retryMs = TRANSIENT_RETRY_BASE_MS * (2 ** (transientAttempts - 1));
+              this.persist();
+              this.metrics.beginWait("transient", Date.now() + retryMs);
+              setProgress({ status: `Discord returned ${status}; retrying automatically (${transientAttempts}/${TRANSIENT_RETRIES})...`, waitMs: retryMs });
+              await this.control.wait(retryMs);
+              this.metrics.endWait();
+              continue;
+            }
+            this.persist();
+            throw error;
+          }
+          const ms = pacingRetry(error);
+          const body = error?.body ?? error?.response?.body;
+          const rawScope = String(responseHeader(error, "X-RateLimit-Scope") ?? "").toLowerCase();
+          const global = body?.global === true || error?.global === true || rawScope === "global" || String(responseHeader(error, "X-RateLimit-Global")).toLowerCase() === "true";
+          const scope = global ? "global" : rawScope === "shared" ? "shared" : "route";
+          this.metrics.limit(identity.operation, scope, ms, error, lane);
+          if (scope === "shared") { resource.limited(ms); if (lane.probing) { lane.currentDelay=Math.max(lane.previousSafe,lane.safeDelay); lane.probing=false; lane.probeSuccesses=0; lane.cleanSuccesses=0; lane.firstCleanAt=0; } lane.probeFreezeUntil=Math.max(lane.probeFreezeUntil,Date.now()+PROBE_FREEZE); } else lane.limited(ms, scope);
+          if (global) this.globalUntil = Math.max(this.globalUntil, Date.now() + ms + PACING_BUFFER);
+          this.limitTimes = this.limitTimes.filter(time => time > Date.now() - 600000);
+          this.limitTimes.push(Date.now());
+          this.persist();
+          setProgress({ status: `Discord ${scope} cooldown; controller adjusted automatically.`, waitMs: Math.max(ms, lane.blocked - Date.now()) });
+          if (this.limitTimes.length >= 6) this.hold("Discord is repeatedly rate limiting this purge. Paused with progress saved; copy the report before resuming.");
+          continue;
+        }
+        this.metrics.response(identity.operation, Number(response?.status ?? 200), Date.now() - requestStart, response);
+        lane = this.bind(identity, kind, response, lane);
+        this.activeLane = lane;
+        const headersAvailable = lane.observe(response);
+        const sharedDelay = resource.cap() ? 60000 / resource.cap() : 0;
+        const routeDelay = lane.effectiveDelay();
+        const sharedBottleneck = sharedDelay > routeDelay + 50;
+        if (sharedBottleneck) { if (lane.probing) { lane.currentDelay=Math.max(lane.previousSafe,lane.safeDelay); lane.probing=false; lane.probeSuccesses=0; lane.cleanSuccesses=0; lane.firstCleanAt=0; } lane.probeFreezeUntil=Math.max(lane.probeFreezeUntil,Date.now()+PROBE_FREEZE); } else lane.success(headersAvailable);
+        resource.success();
+        this.metrics.observePace(identity.operation, lane.effectiveDelay());
+        lane.nextAt = requestStart + lane.effectiveDelay();
+        if (transientAttempts > 0) this.metrics.recoveredTransientRequests++;
+        this.persist();
+        this.control.assertAccount();
+        return response;
+      }
+    }
+    async indexing(ms) {
+      const wait = Number.isFinite(ms) && ms >= 0 ? ms : 1000;
+      this.metrics.indexWaits++;
+      this.metrics.beginWait("indexing", Date.now() + wait);
+      setProgress({ waitMs: wait, status: "Waiting for Discord search index..." });
+      await this.control.wait(wait);
+      this.metrics.endWait();
+    }
+  }
+
+  function copyPurgeTestReport() {
+    const accountId = purgeAccountId();
+    const rate = runtime.rateController;
+    const report = rate?.accountId === accountId ? rate.metrics.report() : storage.shiggyPurgeTestReports?.[accountId];
+    if (!report) { toast("Run a preview or purge to collect a report"); return; }
+    const clipboard = V.metro.common?.clipboard ?? find("setString", "getString") ?? RN.Clipboard;
+    if (!clipboard?.setString) { toast("Clipboard unavailable; take a screenshot of the pacing panel"); return; }
+    try {
+      Promise.resolve(clipboard.setString(JSON.stringify(report, null, 2)))
+        .then(() => toast("Purge report copied. No message content or account identifiers included."))
+        .catch(() => toast("Could not copy the report"));
+    } catch { toast("Could not copy the report"); }
+  }
+  function PacingStatus() {
+    const [, tick] = React.useReducer(value => value + 1, 0);
+    const [advanced, setAdvanced] = React.useState(false);
+    const rate = runtime.rateController;
+    const live = !!runtime.control;
+    React.useEffect(() => {
+      if (!live) return;
+      const timer = setInterval(() => tick(), 1000);
+      return () => clearInterval(timer);
+    }, [live]);
+    if (!rate || rate.accountId !== purgeAccountId()) return null;
+    const metrics = rate.metrics;
+    const now = metrics.finishedAt || Date.now();
+    const report = metrics.report();
+    const range = metrics.etaRange(now);
+    const waiting = Math.max(0, metrics.waitUntil - now);
+    let estimate;
+    if (progress.phase === "paused") estimate = "Paused";
+    else if (!live && ["error", "cancelled"].includes(progress.phase)) estimate = "Stopped — resume required";
+    else if (!range) estimate = ["discovering", "verifying"].includes(progress.phase) ? "Calculating — discovery in progress" : live ? "Calculating…" : "Finished";
+    else if (range.high - range.low > 60000) estimate = `${pacingDuration(range.low)}–${pacingDuration(range.high)}`;
+    else estimate = pacingDuration(range.best);
+    const confidenceText = range ? `${Math.round(range.confidence * 100)}% ETA confidence` : "ETA learning";
+    const sharedMode = report.shared_controller_mode ?? report.controller_mode ?? "observing";
+    const activeCooldown = (report.cooldown_remaining_s ?? 0) > 0 || (metrics.waitKind === "cooldown" && waiting > 0);
+    const speedAdjusting = sharedMode === "probing" || sharedMode === "stabilizing";
+    const softWait = !activeCooldown && ((metrics.waitKind === "indexing" && waiting > 0) || report.in_flight_s >= 5 || speedAdjusting);
+    let badge = "🟢", headline = progress.phase === "discovering" ? "Purge scanning normally" : "Purge running normally";
+    if (progress.phase === "completed") { badge = "✅"; headline = "Purge complete"; }
+    else if (progress.phase === "paused") { badge = "⏸️"; headline = "Purge paused"; }
+    else if (progress.phase === "error") { badge = "⚠️"; headline = "Purge needs attention"; }
+    else if (progress.phase === "cancelled") { badge = "⚠️"; headline = "Purge stopped"; }
+    else if (activeCooldown) { badge = "🔴"; headline = "Discord rate limit active"; }
+    else if (softWait) { badge = "🟡"; headline = sharedMode === "probing" ? "Purge checking speed" : sharedMode === "stabilizing" ? "Purge confirming speed" : "Purge temporarily slowing down"; }
+
+    const targetKind = progress.currentTargetKind ?? "";
+    const targetName = progress.currentTarget ?? "";
+    const guildName = progress.currentGuildName ?? "";
+    const messagesTotal = report.current_target_messages_total ?? 0;
+    const messagesDone = report.current_target_messages_processed ?? 0;
+    const reactionsTotal = report.current_target_reactions_total ?? 0;
+    const reactionsDone = report.current_target_reactions_processed ?? 0;
+    const messagesPending = messagesTotal > messagesDone;
+    const reactionsPending = reactionsTotal > reactionsDone;
+    const reactionPhase = reactionsTotal > 0 && !messagesPending && reactionsPending;
+    const reactionStatus = reactionsTotal <= 0
+      ? "No reactions queued"
+      : messagesPending && reactionsPending
+        ? "Waiting for message deletion to finish"
+        : reactionsPending
+          ? "Cleaning reactions now"
+          : "Reaction cleanup complete";
+    const speedValue = reactionPhase ? (report.reactions_processed_last_60s ?? 0) : (report.deleted_last_60s ?? 0);
+    const speedUnit = reactionPhase ? "reactions" : "messages";
+    const etaText = progress.phase === "paused" ? "Paused" : range ? `About ${pacingDuration(range.best)}` : ["discovering", "verifying"].includes(progress.phase) ? "Calculating while scanning" : "Calculating";
+    const confidencePhrase = !range ? "Learning" : range.confidence >= .8 ? "High confidence" : range.confidence >= .55 ? "Getting more accurate" : "Still learning";
+    const safe = report.shared_safe_per_min;
+    const unsafe = report.shared_unsafe_per_min;
+    const modeText = sharedMode === "probing" ? "Checking a slightly faster speed" : sharedMode === "stabilizing" ? "Confirming the safe speed" : sharedMode === "learned" ? "Safe speed learned" : sharedMode === "cooldown" ? "Temporarily slowing down" : "Learning the safe speed";
+    const whatDoing = progress.phase === "completed"
+      ? "Cleanup finished."
+      : reactionsTotal > 0 && messagesPending
+        ? "Message deletion is being completed first. Reaction cleanup will begin automatically afterward."
+        : activeCooldown
+          ? "Discord asked us to slow down. Purge Tools is waiting and will continue automatically."
+          : sharedMode === "probing"
+            ? "Purge Tools is checking a slightly faster speed without exceeding the 30-per-minute cap."
+            : sharedMode === "stabilizing"
+              ? "Purge Tools is confirming the fastest safe speed."
+              : sharedMode === "learned"
+                ? "Purge Tools is staying within the learned safe speed and will adjust automatically if needed."
+                : "Purge Tools is learning a safe speed and adjusting automatically.";
+
+    return React.createElement(RN.View, null,
+      React.createElement(Txt, { style: { fontWeight: "800", fontSize: 16 } }, `${badge} ${headline}`),
+      targetName ? (targetKind === "dm"
+        ? React.createElement(Txt, { style: { marginTop: 5, fontWeight: "700" } }, `Direct message: ${targetName}`)
+        : targetKind === "channel"
+          ? React.createElement(React.Fragment, null,
+              React.createElement(Txt, { style: { marginTop: 5, fontWeight: "700" } }, `Server: ${guildName || "Unknown server"}`),
+              React.createElement(Txt, { style: { fontWeight: "700" } }, `Channel: ${targetName}`))
+          : targetKind === "server"
+            ? React.createElement(Txt, { style: { marginTop: 5, fontWeight: "700" } }, `Server: ${targetName}`)
+            : React.createElement(Txt, { style: { marginTop: 5, fontWeight: "700" } }, `Target: ${targetName}`)) : null,
+      progress.targetCount > 1 ? React.createElement(Txt, { style: { color: C.muted, fontSize: 12, marginTop: 2 } }, `Target ${progress.targetIndex} of ${progress.targetCount}`) : null,
+
+      metrics.workActive ? React.createElement(React.Fragment, null,
+        React.createElement(Txt, { style: { fontWeight: "700", marginTop: 9 } }, "Messages"),
+        React.createElement(Txt, null, `Progress: ${messagesDone} / ${messagesTotal}`),
+        React.createElement(Txt, { style: { fontWeight: "700", marginTop: 7 } }, "Reactions"),
+        React.createElement(Txt, null, `Progress: ${reactionsDone} / ${reactionsTotal}`),
+        React.createElement(Txt, { style: { color: C.muted } }, `Status: ${reactionStatus}`),
+        reactionsTotal > 0 && messagesPending ? React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, "Reaction cleanup will begin automatically after messages are finished.") : null,
+      ) : React.createElement(React.Fragment, null,
+        progress.phase === "completed"
+          ? React.createElement(React.Fragment, null,
+              React.createElement(Txt, { style: { marginTop: 8 } }, `Messages deleted: ${progress.messagesDeleted}`),
+              React.createElement(Txt, null, `Reactions removed: ${progress.reactionsRemoved}`))
+          : React.createElement(React.Fragment, null,
+              React.createElement(Txt, { style: { marginTop: 8 } }, `Messages found: ${progress.messagesFound}`),
+              React.createElement(Txt, null, `Reactions found: ${progress.reactionsFound}`)),
+        React.createElement(Txt, { style: { color: C.muted } }, progress.status),
+      ),
+
+      progress.phase === "purging" || progress.phase === "paused" ? React.createElement(React.Fragment, null,
+        React.createElement(Txt, { style: { fontWeight: "700", marginTop: 9 } }, "Progress"),
+        React.createElement(Txt, null, `Speed: ${speedValue} ${speedUnit} per minute`),
+        React.createElement(Txt, null, `Time left: ${etaText}`),
+        React.createElement(Txt, null, `ETA confidence: ${range ? Math.round(range.confidence * 100) + "%" : "Learning"} — ${confidencePhrase}`),
+        React.createElement(Txt, { style: { fontWeight: "700", marginTop: 9 } }, "Discord limit"),
+        React.createElement(Txt, null, `🟢 Safe speed: ${safe == null ? "Learning" : "About " + safe + " per minute"}`),
+        React.createElement(Txt, null, `🔴 Too fast: ${unsafe == null ? "Not learned yet" : "Around " + unsafe + " per minute"}`),
+        React.createElement(Txt, null, `Status: ${modeText}`),
+        React.createElement(Txt, { style: { marginTop: 7 } }, `Rate limits: ${report.rate_limits} total · ${report.limits_last_10m} in the last 10 minutes`),
+        React.createElement(Txt, null, `Failures: ${report.failed}`),
+        (report.transient_errors ?? 0) > 0 ? React.createElement(Txt, null, `Transient server errors: ${report.transient_errors} · recovered by retry: ${report.recovered_transient_requests ?? 0} · recovered later: ${report.recovered_failures ?? 0}`) : null,
+        React.createElement(Txt, { style: { fontWeight: "700", marginTop: 9 } }, "What it's doing"),
+        React.createElement(Txt, { style: { color: C.muted } }, whatDoing),
+      ) : null,
+
+      React.createElement(RN.Pressable, { onPress: () => setAdvanced(value => !value), style: { marginTop: 10, paddingVertical: 6 } },
+        React.createElement(Txt, { style: { color: C.brand, fontWeight: "700" } }, advanced ? "Advanced details ▴" : "Advanced details ▾")),
+      advanced ? React.createElement(RN.View, { style: { marginTop: 3 } },
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Requests: ${report.requests_last_1s}/last second · ${report.requests_last_60s}/last minute · ${report.requests_last_3600s}/last hour`),
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Route spacing: ${((report.route_pacing_ms ?? report.current_pacing_ms) / 1000).toFixed(2)}s · Effective spacing: ${((report.effective_pacing_ms ?? report.current_pacing_ms) / 1000).toFixed(2)}s`),
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Route learned safe: ${report.learned_safe_ms == null ? "learning" : (report.learned_safe_ms / 1000).toFixed(2) + "s"} · Shared hard cap: ${report.shared_hard_cap_per_min ?? 30}/min`),
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Shared controller: ${report.shared_controller_mode} · Route confidence: ${report.learning_confidence == null ? "?" : Math.round(report.learning_confidence * 100) + "%"}`),
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Pages scanned: ${progress.pages} · Messages examined: ${progress.scanned}`),
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Reacted emojis checked: ${progress.reactedEmojisChecked} · Reactor users checked: ${progress.reactionUsersChecked}`),
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Bulk batches: ${progress.bulkBatches} · Permission skips: ${progress.permissionSkipped} · Other skips: ${progress.skipped}`),
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, `Rate headers seen: ${report.responses_with_rate_headers} · Active resources: ${report.active_resource_lanes}`),
+      ) : null,
+      React.createElement(Row, null, React.createElement(Button, { text: "Copy report", small: true, onPress: copyPurgeTestReport })),
+    );
+    return React.createElement(Card, { style: { marginTop: 8, borderColor: C.brand } },
+      React.createElement(Txt, { style: { fontWeight: "800", fontSize: 16 } }, `Current target cleanup ETA: ${estimate}`),
+      range && live && !rate.control.paused ? React.createElement(Txt, { style: { color: C.muted } }, `${confidenceText} · likely finish around ${new Date(now + range.best).toLocaleTimeString()}`) : null,
+      React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, "Estimate covers queued cleanup for this target. Discovery, later targets, and additional verification are extra."),
+      metrics.workActive ? React.createElement(Txt, null, `Processed: ${metrics.workDone}/${metrics.workTotal} queued actions`) : null,
+      React.createElement(Txt, null, `Deleted in last minute: ${report.deleted_last_60s} · Elapsed: ${pacingDuration(now - metrics.startedAt)}`),
+      React.createElement(Txt, null, `Requests: ${report.requests_last_1s}/last second · ${report.requests_last_60s}/last minute · ${report.requests_last_3600s}/last hour`),
+      React.createElement(Txt, null, `Controller: ${report.controller_mode} · Rate limits: ${report.rate_limits} · Search-index waits: ${report.search_index_waits}`),
+      React.createElement(Txt, null, `Current spacing: ${(report.current_pacing_ms / 1000).toFixed(2)}s · learned route-safe: ${report.learned_safe_ms == null ? "learning" : (report.learned_safe_ms / 1000).toFixed(2) + "s"}`),
+      report.shared_safe_per_min != null ? React.createElement(Txt, null, `Shared rolling governor: ${report.shared_safe_per_min}/min safe · ${report.shared_unsafe_per_min ?? "?"}/min unsafe · ${report.shared_controller_mode}`) : null,
+      report.known_unsafe_ms != null ? React.createElement(Txt, null, `Known unsafe boundary: ${(report.known_unsafe_ms / 1000).toFixed(2)}s · confidence: ${Math.round((report.learning_confidence ?? 0) * 100)}%`) : null,
+      waiting ? React.createElement(Txt, null, `${metrics.waitKind === "cooldown" ? "Discord cooldown" : metrics.waitKind === "indexing" ? "Search indexing" : "Preventive pacing"}: ${pacingDuration(waiting)} remaining`) : null,
+      report.in_flight_s >= 5 ? React.createElement(Txt, null, `Waiting for Discord response: ${report.in_flight_s}s`) : null,
+      React.createElement(Txt, { style: { color: C.muted, fontSize: 12 } }, report.responses_with_rate_headers
+        ? "Discord rate headers detected; the controller combines them with learned pacing and safety headroom."
+        : "No rate headers exposed. The controller learns from sustained success and 429 feedback, then remembers the safe envelope."),
+      React.createElement(Row, null, React.createElement(Button, { text: "Copy test report", small: true, onPress: copyPurgeTestReport })),
+    );
   }
 
   function find(...props) { try { return findByProps(...props); } catch { return undefined; } }
@@ -477,15 +1377,111 @@
     return (!!target.actions?.deleteMessages && messageAuthorMode(target) === "self") || reactionMode(target) === "self";
   }
 
+  function attachmentExtension(value) {
+    const raw = String(
+      value?.filename ?? value?.name ?? value?.url ?? value?.proxy_url ?? value?.proxyUrl ?? ""
+    ).trim();
+    if (raw) {
+      const clean = raw.split(/[?#]/)[0];
+      const match = clean.match(/\.([a-z0-9]{1,12})$/i);
+      if (match) return match[1].toLowerCase();
+    }
+    const type = String(value?.content_type ?? value?.contentType ?? "").toLowerCase().split(";")[0];
+    const subtype = type.match(/^[a-z0-9.+-]+\/([a-z0-9.+-]+)$/i)?.[1];
+    return subtype && /^[a-z0-9]{1,12}$/i.test(subtype) ? subtype.toLowerCase() : "";
+  }
+  function mediaMimeFromUrl(url) {
+    const ext = attachmentExtension({ url });
+    if (["png", "jpg", "jpeg", "webp", "bmp", "avif", "heic", "heif", "svg"].includes(ext)) return `image/${ext === "jpg" ? "jpeg" : ext}`;
+    if (ext === "gif") return "image/gif";
+    if (["mp4", "m4v", "mov", "webm", "mkv", "avi"].includes(ext)) return `video/${ext}`;
+    if (["mp3", "m4a", "wav", "ogg", "oga", "flac", "aac"].includes(ext)) return `audio/${ext}`;
+    return "";
+  }
+  function mediaHost(url) {
+    const match = String(url ?? "").match(/^https?:\/\/([^/?#]+)/i);
+    return match ? match[1].split(":")[0].toLowerCase() : "";
+  }
+  function providerGifUrl(url) {
+    const host = mediaHost(url);
+    return host === "tenor.com" || host.endsWith(".tenor.com") || host === "giphy.com" || host.endsWith(".giphy.com");
+  }
+  function directMediaUrl(url) {
+    const raw = String(url ?? "");
+    if (!raw) return false;
+    if (/\.(?:png|jpe?g|gif|webp|bmp|avif|heic|heif|svg|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|wav|ogg|oga|flac|aac)(?:[?#].*)?$/i.test(raw)) return true;
+    const host = mediaHost(raw);
+    return host === "media.discordapp.net" || host === "media.tenor.com" || host === "c.tenor.com" || host === "i.giphy.com" || host === "media.giphy.com";
+  }
   function attachmentKind(attachment) {
     const type = String(attachment?.content_type ?? attachment?.contentType ?? "").toLowerCase();
-    const name = String(attachment?.filename ?? attachment?.name ?? "").toLowerCase();
+    const ext = attachmentExtension(attachment);
     if (/^(image|video|audio)\//.test(type)) return "media";
-    if (/\.(?:png|jpe?g|gif|webp|bmp|avif|heic|heif|svg|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|wav|ogg|oga|flac|aac)$/i.test(name)) return "media";
+    if (/^(?:png|jpe?g|gif|webp|bmp|avif|heic|heif|svg|mp4|m4v|mov|webm|mkv|avi|mp3|m4a|wav|ogg|oga|flac|aac)$/i.test(ext)) return "media";
     return "file";
   }
+  function messageAttachmentItems(message) {
+    const items = [];
+    const seen = new Set();
+    const add = item => {
+      if (!item) return;
+      const key = String(item.id ?? item.url ?? item.proxy_url ?? item.proxyUrl ?? item.filename ?? item.name ?? "");
+      if (key && seen.has(key)) return;
+      if (key) seen.add(key);
+      items.push(item);
+    };
+
+    for (const attachment of Array.isArray(message?.attachments) ? message.attachments : []) add(attachment);
+
+    for (const embed of Array.isArray(message?.embeds) ? message.embeds : []) {
+      const type = String(embed?.type ?? "").toLowerCase();
+      const provider = String(embed?.provider?.name ?? "").toLowerCase();
+      const pageUrl = String(embed?.url ?? "");
+      const mediaUrl = String(embed?.video?.url ?? embed?.image?.url ?? embed?.thumbnail?.url ?? pageUrl ?? "");
+      const gifLike = type === "gifv" || provider.includes("tenor") || provider.includes("giphy") || providerGifUrl(pageUrl) || providerGifUrl(mediaUrl);
+      const direct = directMediaUrl(mediaUrl) || directMediaUrl(pageUrl);
+      const renderedMedia = type === "image" || type === "gifv" || gifLike || (type === "video" && direct) || (!!(embed?.image || embed?.video) && direct);
+      if (!renderedMedia) continue;
+      add({
+        id: embed?.id,
+        filename: gifLike ? "linked-media.gif" : mediaUrl,
+        name: gifLike ? "linked-media.gif" : mediaUrl,
+        url: mediaUrl || pageUrl,
+        content_type: gifLike ? "image/gif" : type === "video" ? "video/external" : (mediaMimeFromUrl(mediaUrl || pageUrl) || "image/external"),
+        __purgeLinkedMedia: true,
+      });
+    }
+
+    const urls = String(message?.content ?? "").match(/https?:\/\/[^\s<>()]+/gi) ?? [];
+    for (const rawUrl of urls) {
+      const url = rawUrl.replace(/[),.!?]+$/, "");
+      const gifLike = providerGifUrl(url);
+      if (!gifLike && !directMediaUrl(url)) continue;
+      add({
+        filename: gifLike ? "linked-media.gif" : url,
+        name: gifLike ? "linked-media.gif" : url,
+        url,
+        content_type: gifLike ? "image/gif" : (mediaMimeFromUrl(url) || "image/external"),
+        __purgeLinkedMedia: true,
+      });
+    }
+
+    return items;
+  }
+  function preservedAttachmentExtensions(target) {
+    return [...new Set(String(target?.preserveAttachmentExtensions ?? "")
+      .toLowerCase()
+      .split(/[\s,;]+/)
+      .map(value => value.replace(/^\.+/, "").trim())
+      .filter(value => /^[a-z0-9]{1,12}$/.test(value)))];
+  }
+  function messageHasPreservedAttachment(message, target) {
+    const kept = new Set(preservedAttachmentExtensions(target));
+    if (!kept.size) return false;
+    return messageAttachmentItems(message).some(item => kept.has(attachmentExtension(item)));
+  }
   function selectedAttachmentMatch(message, target) {
-    const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+    const attachments = messageAttachmentItems(message);
     if (!attachments.length) return false;
     const types = target.attachmentTypes ?? "both";
     if (types === "both") return true;
@@ -495,6 +1491,7 @@
     if (target.preservePinned !== false && message?.pinned === true) return false;
     const mode = target.attachmentMode ?? "all";
     if (mode === "all") return true;
+    if (messageHasPreservedAttachment(message, target)) return false;
     const matches = selectedAttachmentMatch(message, target);
     if (mode === "preserve") return !matches;
     if (mode === "only") return matches;
@@ -528,7 +1525,7 @@
 
   async function get(rt, rate, control, lane, url, query) {
     await control.check();
-    return rate.run(lane, "read", () => rt.rest.get({ url, query }));
+    return rate.run(lane, "read", () => rt.rest.get({ url, query }), url);
   }
   function body(response) { return response?.body; }
 
@@ -592,7 +1589,7 @@
     let last;
 
     for (;;) {
-      setProgress({ currentTarget: target.name, status: `Scanning ${target.name}...` });
+      setProgress({ currentTarget: target.name, currentTargetKind: target.kind, currentGuildName: target.guildName ?? "", currentChannelName: target.kind === "channel" ? target.name : "", status: `Scanning ${target.name}...` });
       const page = body(await get(
         rt, rate, control,
         `history:${channelId}`,
@@ -678,7 +1675,7 @@
     let maxId = bounds.max_id;
     let previous;
     for (;;) {
-      setProgress({ currentTarget: target.name, status: `Searching ${target.name}...` });
+      setProgress({ currentTarget: target.name, currentTargetKind: target.kind, currentGuildName: target.guildName ?? "", currentChannelName: target.kind === "channel" ? target.name : "", status: `Searching ${target.name}...` });
       const response = await get(
         rt, rate, control,
         `search:${guildId}`,
@@ -698,8 +1695,7 @@
       bump({ pages: 1 });
       if (response?.status === 202 || responseBody.code === 110000) {
         const ms = Math.max(250, Number(responseBody.retry_after ?? 1) * 1000);
-        setProgress({ waitMs: ms, status: "Waiting for Discord search index..." });
-        await control.wait(ms);
+        await rate.indexing(ms);
         continue;
       }
       const hits = flattenSearch(responseBody)
@@ -880,30 +1876,57 @@
     const code = error?.body?.code ?? error?.response?.body?.code;
     return status === 404 || code === 10008 || code === 10014;
   }
+  function failureTaskKey(kind, item) {
+    return kind === "reaction"
+      ? `reaction:${item.channelId}:${item.messageId}:${item.emoji}:${item.userId ?? "@me"}`
+      : `message:${item.channelId}:${item.messageId}`;
+  }
+  function markTaskFailed(key) {
+    runtime.unresolvedFailures.add(key);
+    setProgress({ failed: runtime.unresolvedFailures.size });
+  }
+  function markTaskResolved(key) {
+    if (!runtime.unresolvedFailures.delete(key)) return;
+    setProgress({
+      failed: runtime.unresolvedFailures.size,
+      recoveredFailures: (progress.recoveredFailures ?? 0) + 1,
+    });
+  }
 
   async function deleteOne(rt, rate, control, message) {
     await control.check();
+    const failureKey = failureTaskKey("message", message);
     try {
       await rate.run(`delete:${message.channelId}`, "modify", () => rt.rest.del({
         url: `/channels/${message.channelId}/messages/${message.messageId}`,
       }));
+      rate.metrics.finishTask("delete", 1, true);
       bump({ messagesDeleted: 1 });
+      markTaskResolved(failureKey);
       return true;
     } catch (error) {
-      bump(missing(error) ? { skipped: 1 } : { failed: 1 });
+      if (error?.purgeStop || control.cancelled) throw error;
+      rate.metrics.finishTask("delete", 1);
+      if (missing(error)) { markTaskResolved(failureKey); bump({ skipped: 1 }); }
+      else markTaskFailed(failureKey);
       return false;
     }
   }
   async function bulkDelete(rt, rate, control, channelId, batch) {
-    if (!rt.rest.post || batch.length < 2) return false;
+    if (!rt.rest.post || batch.length < 2) { rate.metrics.fallbackBatch(batch.length); return false; }
     try {
       await rate.run(`bulk-delete:${channelId}`, "modify", () => rt.rest.post({
         url: `/channels/${channelId}/messages/bulk-delete`,
         body: { messages: batch.map(message => message.messageId) },
       }));
+      rate.metrics.finishTask("bulk-delete", batch.length, true);
       bump({ messagesDeleted: batch.length, bulkBatches: 1 });
       return true;
-    } catch { return false; }
+    } catch (error) {
+      if (error?.purgeStop || control.cancelled) throw error;
+      rate.metrics.fallbackBatch(batch.length);
+      return false;
+    }
   }
 
   async function purgeMessages(rt, rate, control, messages, target, verify) {
@@ -933,6 +1956,7 @@
         const channel = channelObject(rt, channelId);
         const guildId = channel?.guild_id ?? channel?.guildId ?? target.guildId ?? (target.kind === "server" ? target.id : undefined);
         if (canManageMessages(rt, channelId, channel, guildId) !== true) {
+          rate.metrics.skipMessages(items, target);
           bump({ permissionSkipped: items.length });
           continue;
         }
@@ -954,6 +1978,7 @@
           const channel = channelObject(rt, message.channelId);
           const guildId = channel?.guild_id ?? channel?.guildId ?? target.guildId ?? (target.kind === "server" ? target.id : undefined);
           if (canManageMessages(rt, message.channelId, channel, guildId) !== true) {
+            rate.metrics.finishTask("delete", 1);
             bump({ permissionSkipped: 1 });
             continue;
           }
@@ -971,12 +1996,14 @@
     let index = 0;
     for (const reaction of ordered) {
       await control.check();
+      const failureKey = failureTaskKey("reaction", reaction);
       const encoded = encodeURIComponent(reaction.emoji);
       const specific = !!reaction.userId;
       if (specific) {
         const channel = channelObject(rt, reaction.channelId);
         const guildId = channel?.guild_id ?? channel?.guildId ?? target.guildId ?? (target.kind === "server" ? target.id : undefined);
         if (canManageMessages(rt, reaction.channelId, channel, guildId) !== true) {
+          rate.metrics.finishTask("reaction", 1);
           bump({ permissionSkipped: 1 });
           continue;
         }
@@ -989,16 +2016,24 @@
         await rate.run(`reaction:${reaction.channelId}`, "modify", () => rt.rest.del({
           url: `/channels/${reaction.channelId}/messages/${reaction.messageId}/reactions/${encoded}/${suffix}`,
         }));
+        rate.metrics.finishTask("reaction", 1);
         bump({ reactionsRemoved: 1 });
+        markTaskResolved(failureKey);
       } catch (error) {
-        bump(missing(error) ? { skipped: 1 } : { failed: 1 });
+        if (error?.purgeStop || control.cancelled) throw error;
+        rate.metrics.finishTask("reaction", 1);
+        if (missing(error)) { markTaskResolved(failureKey); bump({ skipped: 1 }); }
+        else markTaskFailed(failureKey);
       }
     }
   }
 
   async function purgeFound(rt, rate, control, found, target, verify = false) {
+    rate.metrics.beginWork(found, target, verify);
     await purgeMessages(rt, rate, control, found.messages, target, verify);
     await purgeReactions(rt, rate, control, found.reactions, target, verify);
+    await control.check();
+    rate.metrics.endWork();
   }
 
   function validateTarget(target, rt) {
@@ -1025,14 +2060,16 @@
 
     for (const target of spec.targets) {
       await control.check();
-      setProgress({ phase: "discovering", targetIndex: ++index, currentTarget: target.name, status: `Previewing ${target.name}...` });
+      setProgress({ phase: "discovering", targetIndex: ++index, currentTarget: target.name, currentTargetKind: target.kind, currentGuildName: target.guildName ?? "", currentChannelName: target.kind === "channel" ? target.name : "", status: `Previewing ${target.name}...` });
       const found = dedupe(await discoverTarget(rt, rate, control, target));
       targets[target.key] = found;
       messageTotal += found.messages.length;
       reactionTotal += found.reactions.length;
     }
 
+    await control.check();
     runtime.previewSnapshot = {
+      accountId: purgeAccountId(),
       signature: previewSignature(spec),
       createdAt: Date.now(),
       targets,
@@ -1052,6 +2089,7 @@
     if (!saved) {
       saved = {
         version: JOB_VERSION,
+        accountId: purgeAccountId(),
         createdAt: Date.now(),
         updatedAt: Date.now(),
         completedKeys: [],
@@ -1079,7 +2117,7 @@
           phase: "purging",
           targetIndex: index + 1,
           targetCount: total,
-          currentTarget: target.name,
+          currentTarget: target.name, currentTargetKind: target.kind, currentGuildName: target.guildName ?? "", currentChannelName: target.kind === "channel" ? target.name : "",
           status: `Using preview snapshot for ${target.name}; skipping discovery. ${found.messages.length} messages and ${found.reactions.length} reactions queued.`,
         });
       } else {
@@ -1087,7 +2125,7 @@
           phase: "discovering",
           targetIndex: index + 1,
           targetCount: total,
-          currentTarget: target.name,
+          currentTarget: target.name, currentTargetKind: target.kind, currentGuildName: target.guildName ?? "", currentChannelName: target.kind === "channel" ? target.name : "",
           status: `${resume ? "Resuming" : "Discovering"} ${target.name}...`,
         });
         found = dedupe(await discoverTarget(rt, rate, control, target));
@@ -1109,6 +2147,7 @@
         }
       }
 
+      await control.check();
       completed.add(target.key);
       saved.completedKeys = [...completed];
       saved.currentKey = null;
@@ -1135,6 +2174,7 @@
 
     const control = new Control();
     runtime.control = control;
+    runtime.unresolvedFailures.clear();
     progress = {
       ...emptyProgress(),
       phase: previewSnapshot ? "purging" : "discovering",
@@ -1144,6 +2184,7 @@
     };
     notify();
     const rate = new RateController(control);
+    runtime.rateController = rate;
 
     void (async () => {
       try {
@@ -1163,6 +2204,7 @@
           });
         }
       } finally {
+        try { rate.metrics.finish(); } catch { toast("Could not save the purge test report"); }
         if (runtime.control === control) runtime.control = null;
         notify();
       }
@@ -1288,6 +2330,7 @@
       preservePinned: true,
       attachmentMode: "all",
       attachmentTypes: "both",
+      preserveAttachmentExtensions: "",
       filter: { mode: "all" },
       actions: { deleteMessages: true },
     };
@@ -1376,19 +2419,31 @@
       React.createElement(Row, null,
         React.createElement(Chip, { text: "No attachment filter", active: attachmentMode === "all", disabled, onPress: () => onChange({ ...target, attachmentMode: "all" }) }),
         React.createElement(Chip, { text: "Preserve attachments", active: attachmentMode === "preserve", disabled, onPress: () => onChange({ ...target, attachmentMode: "preserve" }) }),
-        React.createElement(Chip, { text: "Only attachments", active: attachmentMode === "only", disabled, onPress: () => onChange({ ...target, attachmentMode: "only" }) }),
+        React.createElement(Chip, { text: "Only attachments / media", active: attachmentMode === "only", disabled, onPress: () => onChange({ ...target, attachmentMode: "only" }) }),
       ),
       attachmentMode !== "all" ? React.createElement(React.Fragment, null,
         React.createElement(Txt, { style: { fontWeight: "700", marginTop: 5, marginBottom: 6 } }, "Attachment types"),
         React.createElement(Row, null,
-          React.createElement(Chip, { text: "Images / media", active: attachmentTypes === "media", disabled, onPress: () => onChange({ ...target, attachmentTypes: "media" }) }),
+          React.createElement(Chip, { text: "Images / GIFs / media", active: attachmentTypes === "media", disabled, onPress: () => onChange({ ...target, attachmentTypes: "media" }) }),
           React.createElement(Chip, { text: "Other files", active: attachmentTypes === "file", disabled, onPress: () => onChange({ ...target, attachmentTypes: "file" }) }),
           React.createElement(Chip, { text: "Both", active: attachmentTypes === "both", disabled, onPress: () => onChange({ ...target, attachmentTypes: "both" }) }),
         ),
-        React.createElement(Txt, { style: { color: C.muted, fontSize: 12, marginTop: 3 } },
+        attachmentMode === "only" ? React.createElement(React.Fragment, null,
+          React.createElement(Txt, { style: { fontWeight: "700", marginTop: 8, marginBottom: 4 } }, "Always keep file extensions"),
+          React.createElement(Input, {
+            value: target.preserveAttachmentExtensions ?? "",
+            onChange: next => onChange({ ...target, preserveAttachmentExtensions: next }),
+            disabled,
+            placeholder: "ogg, oga, mp3",
+          }),
+          React.createElement(Txt, { style: { color: C.muted, fontSize: 12, marginTop: 3 } },
+            "Comma/space-separated. If a matching message contains one of these file types, the whole message is kept. Example: ogg keeps OGG audio/voice messages while other attachments can still be purged."
+          ),
+        ) : null,
+        React.createElement(Txt, { style: { color: C.muted, fontSize: 12, marginTop: 5 } },
           attachmentMode === "preserve"
-            ? "Any message containing a matching uploaded attachment is kept intact, including its text."
-            : "Only messages containing a matching uploaded attachment are eligible for message deletion."
+            ? "Any message containing matching uploaded or rendered media is kept intact, including its text."
+            : "Only messages containing matching uploaded or rendered media are eligible for message deletion. GIF-picker links, Tenor/Giphy media, and direct rendered image/media links are included in preview, purge, and verification."
         ),
       ) : null,
     );
@@ -1463,7 +2518,7 @@
 
   function Settings() {
     const [cat, setCat] = React.useState({ dms: [], guilds: [] });
-    const [selected, setSelected] = React.useState({});
+    const [selected, setSelected] = React.useState(() => { try { const accountId = purgeAccountId(); const draft = storage.shiggyPurgeDraftTargets?.[accountId]; return draft && typeof draft === "object" && !Array.isArray(draft) ? clone(draft) : {}; } catch { return {}; } });
     const [verify, setVerify] = React.useState(true);
     const [pickerType, setPickerType] = React.useState("server");
     const [pickerDmId, setPickerDmId] = React.useState("");
@@ -1474,6 +2529,18 @@
     const [manualId, setManualId] = React.useState("");
     const [manualName, setManualName] = React.useState("");
     const [, render] = React.useReducer(value => value + 1, 0);
+
+    React.useEffect(() => {
+      try {
+        const accountId = purgeAccountId();
+        if (accountId) {
+          const drafts = { ...(storage.shiggyPurgeDraftTargets ?? {}) };
+          if (Object.keys(selected).length) drafts[accountId] = clone(selected);
+          else delete drafts[accountId];
+          storage.shiggyPurgeDraftTargets = drafts;
+        }
+      } catch {}
+    }, [selected]);
 
     React.useEffect(() => {
       const listener = () => render();
@@ -1521,7 +2588,7 @@
     const prepareSpec = () => ({ targets: targets.map(target => clone(target)), verify });
     const readyPreview = getMatchingPreviewSnapshot(prepareSpec());
     const previewReady = !!readyPreview;
-    const beginPreview = () => { try { startJob(prepareSpec(), { preview: true }); } catch (error) { toast(error?.message ?? error); } };
+    const beginPreview = () => { try { const accountId = purgeAccountId(); if (accountId) { const drafts = { ...(storage.shiggyPurgeDraftTargets ?? {}) }; drafts[accountId] = clone(selected); storage.shiggyPurgeDraftTargets = drafts; } startJob(prepareSpec(), { preview: true }); } catch (error) { toast(error?.message ?? error); } };
 
     const confirmStart = () => {
       try {
@@ -1567,10 +2634,11 @@
         React.createElement(Txt, { style: { color: C.muted, marginTop: 4 } }, `${savedJob.completedKeys?.length ?? 0}/${savedJob.spec.targets.length} targets completed${savedJob.currentKey ? ` · interrupted in ${savedJob.currentKey}` : ""}.`),
         React.createElement(Row, null,
           React.createElement(Button, { text: "Resume purge", active: true, onPress: resumeJob }),
-          React.createElement(Button, { text: "Discard saved job", danger: true, onPress: () => RN.Alert.alert("Discard saved purge?", "This removes the resume checkpoint. It does not restore anything already deleted.", [{ text: "Keep", style: "cancel" }, { text: "Discard", style: "destructive", onPress: clearSavedJob }]) }),
+          React.createElement(Button, { text: "Discard saved job", danger: true, onPress: () => { clearSavedJob(); toast("Saved purge checkpoint discarded"); } }),
         ),
       ) : null,
 
+      runtime.rateController?.accountId !== purgeAccountId() && storage.shiggyPurgeTestReports?.[purgeAccountId()] ? React.createElement(Button, { text: "Copy last report", small: true, onPress: copyPurgeTestReport }) : null,
       React.createElement(Toggle, { label: "Auto-resume interrupted purge", value: storage.autoResumeInterrupted === true, disabled: running, onChange: next => { storage.autoResumeInterrupted = next; notify(); }, desc: "Automatically continue a saved purge after Discord/plugin reloads." }),
       React.createElement(Toggle, { label: "Verify after each target", value: verify, disabled: running, onChange: setVerify, desc: "Re-scan each target and clean anything still matching before marking it complete." }),
       React.createElement(Row, null, React.createElement(Button, { text: "Refresh DMs / servers", small: true, disabled: running, onPress: refresh })),
@@ -1646,112 +2714,13 @@
         React.createElement(Button, { text: "Cancel + discard job", danger: true, onPress: () => runtime.control?.cancel(true) }),
       ) : null,
 
-      progress.phase !== "idle" ? React.createElement(Card, { style: { marginTop: 8 } },
-        React.createElement(Txt, { style: { fontWeight: "800", fontSize: 16 } }, progress.phase.toUpperCase()),
-        React.createElement(Txt, null, progress.status),
-        React.createElement(Txt, null, `Target: ${progress.targetIndex}/${progress.targetCount}${progress.currentTarget ? ` · ${progress.currentTarget}` : ""}`),
-        React.createElement(Txt, null, `Pages: ${progress.pages} · Messages examined: ${progress.scanned}`),
-        React.createElement(Txt, null, `Matched messages: ${progress.messagesFound} · Reactions matched: ${progress.reactionsFound}`),
-        React.createElement(Txt, null, `Reacted emojis checked: ${progress.reactedEmojisChecked} · Reactor users checked: ${progress.reactionUsersChecked}`),
-        React.createElement(Txt, null, `Deleted: ${progress.messagesDeleted} · Reactions removed: ${progress.reactionsRemoved}`),
-        React.createElement(Txt, null, `Bulk batches: ${progress.bulkBatches} · Permission skips: ${progress.permissionSkipped} · Other skips: ${progress.skipped} · Failed: ${progress.failed}`),
-        progress.waitMs ? React.createElement(Txt, { style: { color: C.muted } }, `Adaptive wait: ${(progress.waitMs / 1000).toFixed(1)}s`) : null,
+      progress.phase !== "idle" ? React.createElement(Card, { style: { marginTop: 8, borderColor: C.brand } },
+        React.createElement(PacingStatus),
       ) : null,
 
       React.createElement(Txt, { style: { color: C.muted, fontSize: 12, marginTop: 10 } }, "Safety: moderator actions require a verified Manage Messages permission per channel. Specific-user reactions enumerate reactor lists and delete only that user's matching emoji reaction; own-reaction cleanup uses /@me only. No clear-all reaction route is used."),
       React.createElement(Txt, { style: { color: C.muted, fontSize: 12, marginTop: 6 } }, "Background note: this JS plugin runs only while Android keeps Discord's process alive. Persistent checkpoints let it resume after Discord is reopened."),
     );
-  }
-
-  let settingsShortcutCleanup = null;
-
-  function installSettingsShortcut() {
-    try { settingsShortcutCleanup?.(); } catch {}
-    settingsShortcutCleanup = null;
-
-    const settingConstants = find("SETTING_RENDERER_CONFIG");
-    const createListModule = find("createList");
-    if (!settingConstants || !createListModule?.createList) {
-      toast("Purge Tools shortcut unavailable on this Revenge build");
-      return;
-    }
-
-    const shortcutKey = "ITS_TRIPLE_SIX_PURGE_TOOLS";
-    const rootNavigation = find("getRootNavigationRef");
-    const trashIcon = V.ui?.assets?.getAssetIDByName?.("TrashIcon")
-      ?? V.ui?.assets?.getAssetIDByName?.("DeleteIcon");
-
-    const openPurgeTools = () => {
-      try {
-        const navigation = rootNavigation?.getRootNavigationRef?.();
-        if (!navigation?.navigate) throw new Error("Navigation unavailable");
-        navigation.navigate("BUNNY_CUSTOM_PAGE", {
-          title: "Purge Tools",
-          render: () => React.createElement(Settings),
-        });
-      } catch (error) {
-        toast(`Could not open Purge Tools: ${error?.message ?? error}`);
-      }
-    };
-
-    try {
-      const current = settingConstants.SETTING_RENDERER_CONFIG ?? {};
-      settingConstants.SETTING_RENDERER_CONFIG = {
-        ...current,
-        [shortcutKey]: {
-          type: "pressable",
-          useTitle: () => "Purge Tools",
-          title: () => "Purge Tools",
-          icon: trashIcon,
-          IconComponent: trashIcon != null
-            ? () => React.createElement(RN.Image, {
-                source: trashIcon,
-                style: { width: 24, height: 24, tintColor: C.text },
-              })
-            : undefined,
-          onPress: openPurgeTools,
-          withArrow: true,
-        },
-      };
-    } catch (error) {
-      toast(`Could not register Purge Tools shortcut: ${error?.message ?? error}`);
-      return;
-    }
-
-    const unpatch = V.patcher.after("createList", createListModule, args => {
-      try {
-        const sections = args?.[0]?.sections;
-        if (!Array.isArray(sections)) return;
-
-        const section = sections.find(item =>
-          Array.isArray(item?.settings) && item.settings.includes("BUNNY")
-        ) ?? sections.find(item => item?.label === "Revenge" || item?.title === "Revenge");
-
-        if (!section || !Array.isArray(section.settings) || section.settings.includes(shortcutKey)) return;
-
-        const fontsIndex = section.settings.indexOf("BUNNY_FONTS");
-        const pluginsIndex = section.settings.indexOf("BUNNY_PLUGINS");
-        const insertAt = fontsIndex >= 0
-          ? fontsIndex + 1
-          : pluginsIndex >= 0
-            ? pluginsIndex + 1
-            : section.settings.length;
-
-        section.settings.splice(insertAt, 0, shortcutKey);
-      } catch {}
-    });
-
-    settingsShortcutCleanup = () => {
-      try { unpatch?.(); } catch {}
-      try {
-        const current = settingConstants.SETTING_RENDERER_CONFIG ?? {};
-        if (current[shortcutKey]) {
-          const next = { ...current };
-          delete next[shortcutKey];
-          settingConstants.SETTING_RENDERER_CONFIG = next;
-        }
-      } catch {}
-    };
   }
 
   function scheduleAutoResume() {
@@ -1764,8 +2733,6 @@
   }
 
   function cleanup() {
-    try { settingsShortcutCleanup?.(); } catch {}
-    settingsShortcutCleanup = null;
     if (runtime.autoResumeTimer) { clearTimeout(runtime.autoResumeTimer); runtime.autoResumeTimer = null; }
     try { runtime.control?.cancel(false); } catch {}
     runtime.listeners.clear();
@@ -1776,7 +2743,7 @@
   runtime.cleanup = cleanup;
 
   return {
-    onLoad() { installSettingsShortcut(); scheduleAutoResume(); },
+    onLoad() { scheduleAutoResume(); },
     onUnload() { cleanup(); },
     settings: Settings,
   };
